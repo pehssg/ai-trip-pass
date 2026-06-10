@@ -247,52 +247,98 @@ def haversine(lat1, lon1, lat2, lon2) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 
-def get_opinet_fuel_price(fuel_type: str) -> int:
+def get_opinet_fuel_price(fuel_type: str) -> tuple[int, str]:
     """
-    오피넷 웹 스크래핑으로 전국 평균 유가를 가져옵니다.
+    오피넷 API (오피넷 공공데이터 XML)로 전국 평균 유가를 가져옵니다.
+    방법1: 오피넷 셀프주유소 전국평균 API
+    방법2: 오피넷 메인 페이지 스크래핑
     실패 시 예비 데이터를 반환합니다.
+    반환값: (가격, 출처설명)
     """
+    code_map = {"휘발유": "B027", "경유": "D047", "LPG": "K015"}
+    prod_cd = code_map.get(fuel_type, "B027")
+    today = datetime.date.today().strftime("%Y%m%d")
+
+    # ── 방법 1: 오피넷 공식 XML API ─────────────────────────
+    # 공공데이터포털 오피넷 API (인증키 불필요한 엔드포인트)
     try:
-        code_map = {"휘발유": "B027", "경유": "D047", "LPG": "K015"}
-        code = code_map.get(fuel_type, "B027")
+        api_url = (
+            "https://www.opinet.co.kr/api/avgAllPrice.do"
+            f"?out=xml&prodcd={prod_cd}"
+        )
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; AITripPass/1.0)"}
+        resp = requests.get(api_url, headers=headers, timeout=6)
+        if resp.status_code == 200:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(resp.content)
+            price_el = root.find(".//PRICE")
+            if price_el is not None and price_el.text:
+                return int(float(price_el.text)), "오피넷 API"
+    except Exception:
+        pass
+
+    # ── 방법 2: 오피넷 AJAX JSON 엔드포인트 ─────────────────
+    try:
+        json_url = "https://www.opinet.co.kr/api/avgAllPrice.do?out=json"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Referer": "https://www.opinet.co.kr/",
+        }
+        resp = requests.get(json_url, headers=headers, timeout=6)
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data.get("RESULT", {}).get("OIL", [])
+            for item in items:
+                if item.get("PRODCD") == prod_cd:
+                    return int(float(item.get("PRICE", 0))), "오피넷 JSON API"
+    except Exception:
+        pass
+
+    # ── 방법 3: 오피넷 메인 스크래핑 ────────────────────────
+    try:
         url = "https://www.opinet.co.kr/user/main/mainView.do"
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "ko-KR,ko;q=0.9",
             "Referer": "https://www.opinet.co.kr/",
         }
         resp = requests.get(url, headers=headers, timeout=8)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 오피넷 메인 페이지 평균 가격 파싱 시도
-        price_tags = soup.select(".price_wrap .price, .avg_price, #national_oil_price")
-        for tag in price_tags:
-            text = tag.get_text(strip=True).replace(",", "")
-            nums = re.findall(r"\d{4}", text)
-            if nums:
-                return int(nums[0])
+        # 현재 오피넷 DOM 구조에 맞는 선택자들
+        selectors = [
+            "#oilprice_wrap .price",
+            ".today_oil .num",
+            ".oil_price_wrap strong",
+            "div.price_area strong",
+            "#avgPriceWrap .price",
+        ]
+        for sel in selectors:
+            tags = soup.select(sel)
+            for tag in tags:
+                txt = tag.get_text(strip=True).replace(",", "").replace("원", "")
+                nums = re.findall(r"\d{3,4}(?:\.\d+)?", txt)
+                if nums:
+                    val = int(float(nums[0]))
+                    if 500 < val < 4000:
+                        return val, "오피넷 스크래핑"
 
-        # 대안: 텍스트 전체에서 숫자 패턴 찾기
+        # 전체 텍스트 패턴 매칭
         all_text = soup.get_text()
-        if fuel_type == "휘발유":
-            pattern = r"휘발유[^\d]*(\d{1,2},?\d{3})"
-        elif fuel_type == "경유":
-            pattern = r"경유[^\d]*(\d{1,2},?\d{3})"
-        else:
-            pattern = r"LPG[^\d]*(\d{3,4})"
-
-        m = re.search(pattern, all_text)
+        kw = {"휘발유": "휘발유", "경유": "경유", "LPG": "LPG"}.get(fuel_type, "휘발유")
+        m = re.search(rf"{kw}[^\d]{{0,20}}(\d{{1,2}},?\d{{3}}(?:\.\d+)?)", all_text)
         if m:
-            return int(m.group(1).replace(",", ""))
-
-        return FALLBACK_FUEL_PRICES[fuel_type]
-
+            val = int(float(m.group(1).replace(",", "")))
+            if 500 < val < 4000:
+                return val, "오피넷 스크래핑(텍스트)"
     except Exception:
-        return FALLBACK_FUEL_PRICES[fuel_type]
+        pass
+
+    # ── Fallback ─────────────────────────────────────────────
+    return FALLBACK_FUEL_PRICES[fuel_type], "예비 데이터 (네트워크 불가)"
 
 
 def estimate_distance(origin: str, destination: str) -> float:
@@ -400,6 +446,82 @@ def extract_exif_gps(image: Image.Image) -> dict | None:
         return None
 
 
+@st.cache_resource
+def load_korean_font() -> dict:
+    """
+    한글 폰트(NanumGothic)를 로드합니다.
+    Streamlit Cloud 환경에서는 apt 설치 경로를 먼저 확인하고,
+    없으면 GitHub에서 다운로드합니다.
+    반환값: {"regular": 폰트명, "bold": 폰트명}
+    """
+    candidates = [
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+        "/home/appuser/.fonts/NanumGothic.ttf",
+        "/home/appuser/.fonts/NanumGothicBold.ttf",
+    ]
+
+    def try_register(name, path):
+        try:
+            if os.path.exists(path):
+                pdfmetrics.registerFont(TTFont(name, path))
+                return True
+        except Exception:
+            pass
+        return False
+
+    reg = try_register("NanumGothic", candidates[0])
+    reg_b = try_register("NanumGothicBold", candidates[1])
+
+    if not reg:
+        # Streamlit Cloud: apt-get으로 설치 시도
+        try:
+            import subprocess
+            subprocess.run(
+                ["apt-get", "install", "-y", "fonts-nanum"],
+                capture_output=True, timeout=60
+            )
+            reg   = try_register("NanumGothic",     candidates[0])
+            reg_b = try_register("NanumGothicBold", candidates[1])
+        except Exception:
+            pass
+
+    if not reg:
+        # 최후 수단: GitHub에서 TTF 다운로드
+        font_dir = os.path.expanduser("~/.fonts")
+        os.makedirs(font_dir, exist_ok=True)
+        urls = {
+            "NanumGothic":     ("https://github.com/googlefonts/nanumfont/raw/main/fonts/NanumGothic.ttf",
+                                f"{font_dir}/NanumGothic.ttf"),
+            "NanumGothicBold": ("https://github.com/googlefonts/nanumfont/raw/main/fonts/NanumGothicBold.ttf",
+                                f"{font_dir}/NanumGothicBold.ttf"),
+        }
+        for fname, (url, dst) in urls.items():
+            try:
+                r = requests.get(url, timeout=15)
+                if r.status_code == 200:
+                    with open(dst, "wb") as f:
+                        f.write(r.content)
+                    pdfmetrics.registerFont(TTFont(fname, dst))
+            except Exception:
+                pass
+
+    # 최종 확인: 등록됐는지 체크
+    try:
+        pdfmetrics.getFont("NanumGothic")
+        regular = "NanumGothic"
+    except Exception:
+        regular = "Helvetica"
+
+    try:
+        pdfmetrics.getFont("NanumGothicBold")
+        bold = "NanumGothicBold"
+    except Exception:
+        bold = "Helvetica-Bold"
+
+    return {"regular": regular, "bold": bold}
+
+
 def generate_trip_pdf(
     trip_date:   str,
     destination: str,
@@ -410,93 +532,99 @@ def generate_trip_pdf(
     fuel_price:  int,
     toll_fee:    int,
     total_cost:  float,
+    fuel_source: str = "",
 ) -> bytes:
-    """reportlab으로 출장이행확인서 PDF 생성"""
+    """reportlab + 나눔고딕으로 한글 완전 지원 출장이행확인서 PDF 생성"""
+    fonts = load_korean_font()
+    F  = fonts["regular"]   # 나눔고딕 일반 (또는 Helvetica 폴백)
+    FB = fonts["bold"]      # 나눔고딕 Bold
+
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     W, H = A4
 
-    # ── 배경 및 헤더 ──────────────────────────────
+    # ── 헤더 배너 ─────────────────────────────────
     c.setFillColorRGB(0.10, 0.45, 0.91)
     c.rect(0, H - 90, W, 90, fill=1, stroke=0)
 
     c.setFillColorRGB(1, 1, 1)
-    c.setFont("Helvetica-Bold", 20)
-    c.drawCentredString(W/2, H - 45, "Business Trip Confirmation")
-    c.setFont("Helvetica", 10)
-    c.drawCentredString(W/2, H - 65, "AI-Trip Pass - Auto Generated Document")
+    c.setFont(FB, 20)
+    c.drawCentredString(W/2, H - 42, "출장이행확인서")
+    c.setFont(F, 10)
+    c.drawCentredString(W/2, H - 63, "AI-Trip Pass  자동 생성 문서")
 
-    # ── 본문 영역 ──────────────────────────────────
-    y = H - 110
-    line_h = 28
+    # ── 본문 ──────────────────────────────────────
+    y = H - 108
+    line_h = 27
 
     def section_title(title, yy):
-        c.setFillColorRGB(0.94, 0.97, 1.0)
-        c.rect(40, yy - 6, W - 80, 24, fill=1, stroke=0)
+        c.setFillColorRGB(0.93, 0.96, 1.0)
+        c.rect(38, yy - 5, W - 76, 22, fill=1, stroke=0)
         c.setFillColorRGB(0.10, 0.45, 0.91)
-        c.setFont("Helvetica-Bold", 11)
+        c.setFont(FB, 10)
         c.drawString(50, yy + 4, title)
         return yy - line_h
 
-    def field_row(label, value, yy, bold_value=False):
+    def field_row(label, value, yy):
         c.setFillColorRGB(0.5, 0.5, 0.5)
-        c.setFont("Helvetica", 9)
-        c.drawString(60, yy, label)
+        c.setFont(F, 9)
+        c.drawString(58, yy, label)
         c.setFillColorRGB(0.1, 0.1, 0.1)
-        c.setFont("Helvetica-Bold" if bold_value else "Helvetica", 10)
-        c.drawString(200, yy, str(value))
-        c.setStrokeColorRGB(0.9, 0.9, 0.9)
-        c.line(50, yy - 4, W - 50, yy - 4)
+        c.setFont(F, 10)
+        c.drawString(195, yy, str(value))
+        c.setStrokeColorRGB(0.91, 0.91, 0.91)
+        c.line(50, yy - 5, W - 50, yy - 5)
         return yy - line_h
 
     # 출장 기본 정보
-    y = section_title("[ Trip Information ]", y)
-    y = field_row("출장일 (Trip Date)",           trip_date, y)
-    y = field_row("출장지 (Destination)",          destination, y)
-    y = field_row("이동경로 (Route)",              route_text, y)
-    y = field_row("총 이동거리 (Total Distance)",   f"{distance} km (round trip)", y)
-    y = field_row("자차 이용 사유 (Reason)",        "출장경로 복잡 / 대중교통 불편", y)
+    y = section_title("[ 출장 기본 정보 ]", y)
+    y = field_row("출장일",           trip_date, y)
+    y = field_row("출장지",           destination, y)
+    y = field_row("이동경로",          route_text, y)
+    y = field_row("총 이동거리",       f"{distance} km (왕복)", y)
+    y = field_row("자차 이용 사유",    "출장경로 복잡 / 대중교통 불편", y)
 
-    y -= 10
-    y = section_title("[ Vehicle & Fuel Information ]", y)
-    y = field_row("차량 (Vehicle)",               car_model, y)
-    y = field_row("유종 (Fuel Type)",             fuel_type, y)
-    y = field_row("오피넷 유가 (Fuel Price)",       f"{fuel_price:,} 원/L", y)
+    y -= 8
+    y = section_title("[ 차량 및 유류 정보 ]", y)
+    y = field_row("차종",             car_model, y)
+    y = field_row("유종",             fuel_type, y)
+    src_label = f"오피넷 유가 ({fuel_source})" if fuel_source else "오피넷 유가"
+    y = field_row(src_label,          f"{fuel_price:,} 원/L", y)
 
-    y -= 10
-    y = section_title("[ Cost Breakdown ]", y)
+    y -= 8
+    y = section_title("[ 비용 내역 ]", y)
     fuel_only = total_cost - toll_fee
-    y = field_row("유류비 (Fuel Cost)",            f"{fuel_only:,.0f} 원", y)
-    y = field_row("통행료 (Toll Fee)",             f"{toll_fee:,} 원", y)
+    y = field_row("유류비",           f"{fuel_only:,.0f} 원", y)
+    y = field_row("통행료",           f"{toll_fee:,} 원", y)
 
     # 최종 금액 강조 박스
     y -= 10
-    box_h = 50
-    c.setFillColorRGB(0.89, 0.97, 0.89)
+    box_h = 52
+    c.setFillColorRGB(0.88, 0.97, 0.88)
     c.setStrokeColorRGB(0.30, 0.69, 0.31)
-    c.roundRect(40, y - box_h, W - 80, box_h, 8, fill=1, stroke=1)
+    c.roundRect(38, y - box_h, W - 76, box_h, 8, fill=1, stroke=1)
     c.setFillColorRGB(0.11, 0.37, 0.13)
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(60, y - 18, "Total Claim Amount")
-    c.setFont("Helvetica-Bold", 18)
-    c.drawRightString(W - 60, y - 22, f"{total_cost:,.0f} KRW")
-    y -= (box_h + 20)
+    c.setFont(FB, 11)
+    c.drawString(58, y - 18, "최종 청구 금액")
+    c.setFont(FB, 20)
+    c.drawRightString(W - 58, y - 24, f"{total_cost:,.0f} 원")
+    y -= (box_h + 24)
 
     # 서명란
-    y -= 20
+    y -= 10
     c.setStrokeColorRGB(0.8, 0.8, 0.8)
     c.line(50, y, W - 50, y)
-    c.setFillColorRGB(0.6, 0.6, 0.6)
-    c.setFont("Helvetica", 8)
-    c.drawString(60,   y - 16, "신청인 (Applicant): _______________")
-    c.drawString(260,  y - 16, "부서장 (Dept. Head): _______________")
-    c.drawString(460,  y - 16, "결재 (Approval): _______________")
+    c.setFillColorRGB(0.5, 0.5, 0.5)
+    c.setFont(F, 8)
+    c.drawString(58,  y - 16, "신청인: _______________")
+    c.drawString(218, y - 16, "부서장: _______________")
+    c.drawString(378, y - 16, "결  재: _______________")
 
-    # 생성일시 푸터
+    # 푸터
     c.setFillColorRGB(0.7, 0.7, 0.7)
-    c.setFont("Helvetica", 7)
+    c.setFont(F, 7)
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    c.drawCentredString(W/2, 30, f"Generated by AI-Trip Pass  ·  {now_str}")
+    c.drawCentredString(W/2, 28, f"Generated by AI-Trip Pass  ·  {now_str}")
 
     c.save()
     return buffer.getvalue()
@@ -591,9 +719,13 @@ with tab1:
         with col_btn:
             if st.button("🔄 오피넷 유가 조회", use_container_width=True):
                 with st.spinner("오피넷에서 유가 가져오는 중..."):
-                    price = get_opinet_fuel_price(fuel_type)
+                    price, source = get_opinet_fuel_price(fuel_type)
                 st.session_state.fuel_price = price
-                st.success(f"조회 완료: {price:,}원/L")
+                st.session_state.fuel_source = source
+                if "예비" in source:
+                    st.warning(f"⚠️ 네트워크 제한으로 예비 데이터 사용: {price:,}원/L")
+                else:
+                    st.success(f"✅ {source}: {price:,}원/L")
 
         with col_info:
             manual_price = st.number_input(
@@ -666,7 +798,7 @@ with tab1:
         st.session_state.trip_date = trip_date_input
 
         if st.button("📄 PDF 자동 생성 & 다운로드", use_container_width=True, type="primary"):
-            with st.spinner("PDF 생성 중..."):
+            with st.spinner("PDF 생성 중 (한글 폰트 로딩 포함, 최초 1회 15초 소요될 수 있습니다)..."):
                 pdf_bytes = generate_trip_pdf(
                     trip_date   = st.session_state.trip_date,
                     destination = st.session_state.destination,
@@ -677,6 +809,7 @@ with tab1:
                     fuel_price  = st.session_state.fuel_price,
                     toll_fee    = st.session_state.toll_fee,
                     total_cost  = st.session_state.total_cost,
+                    fuel_source = st.session_state.get("fuel_source", ""),
                 )
 
             filename = f"출장이행확인서_{st.session_state.trip_date.replace('.','')}.pdf"
