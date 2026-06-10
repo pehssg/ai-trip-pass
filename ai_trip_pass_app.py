@@ -403,82 +403,148 @@ def gate_to_city(gate_name: str) -> str | None:
 
 def parse_ocr_text(text: str) -> dict:
     """
-    OCR 텍스트에서 날짜·통행료·출발요금소·도착요금소를 파싱하고
-    요금소명을 도시명으로 자동 변환합니다.
+    OCR/AI 텍스트에서 날짜·통행료·출발요금소·도착요금소를 파싱합니다.
     """
-    # 날짜
     date_match = re.search(r"(\d{4}[.\-/]\d{2}[.\-/]\d{2})", text)
     trip_date  = date_match.group(1) if date_match else datetime.date.today().strftime("%Y.%m.%d")
 
-    # 통행료: '2,400원' / '2400원' / '요금 2400' 등
     toll_match = (
         re.search(r"통행료[^\d]*(\d{1,3},?\d{3})", text) or
         re.search(r"(\d{1,3},?\d{3})\s*원", text)
     )
     toll_fee = int(toll_match.group(1).replace(",", "")) if toll_match else 2400
 
-    # 출발/도착 요금소 — 하이패스 영수증 대표 패턴
-    # 패턴1: "진입: 서울TG" / "출발: 서울"
-    # 패턴2: 텍스트에 연속으로 등장하는 요금소 두 개
     origin_gate = dest_gate = None
-
     entry_m = re.search(r"(?:진입|출발|입구|IN)[^\w가-힣]*([가-힣a-zA-Z0-9]+(?:TG|요금소|IC|JC)?)", text, re.IGNORECASE)
     exit_m  = re.search(r"(?:출구|도착|EXIT|OUT)[^\w가-힣]*([가-힣a-zA-Z0-9]+(?:TG|요금소|IC|JC)?)", text, re.IGNORECASE)
+    if entry_m: origin_gate = entry_m.group(1)
+    if exit_m:  dest_gate   = exit_m.group(1)
 
-    if entry_m:
-        origin_gate = entry_m.group(1)
-    if exit_m:
-        dest_gate = exit_m.group(1)
-
-    # 패턴2: 연속 요금소 (진입/출구 키워드 없을 때)
     if not origin_gate or not dest_gate:
         gates = re.findall(r"([가-힣]{2,5}(?:TG|요금소|IC|JC))", text, re.IGNORECASE)
         if len(gates) >= 2:
             origin_gate = origin_gate or gates[0]
             dest_gate   = dest_gate   or gates[1]
-        elif len(gates) == 1:
-            origin_gate = origin_gate or gates[0]
-
-    # 패턴3: 도시명 직접 등장
-    if not origin_gate:
-        for city in DISTANCE_FROM_SEOUL:
-            if city in text:
-                origin_gate = f"{city}TG"
-                break
 
     origin_gate = origin_gate or "출발요금소"
     dest_gate   = dest_gate   or "도착요금소"
-
-    # 요금소명 → 도시명 변환
     origin_city = gate_to_city(origin_gate)
     dest_city   = gate_to_city(dest_gate)
 
     return {
-        "trip_date":    trip_date,
-        "toll_fee":     toll_fee,
-        "origin_gate":  origin_gate,
-        "dest_gate":    dest_gate,
-        "origin_city":  origin_city,   # None이면 자동 반영 안 함
-        "dest_city":    dest_city,
+        "trip_date":   trip_date,
+        "toll_fee":    toll_fee,
+        "origin_gate": origin_gate,
+        "dest_gate":   dest_gate,
+        "origin_city": origin_city,
+        "dest_city":   dest_city,
     }
 
 
-def mock_ocr_receipt(image) -> dict:
+def analyze_receipt_with_claude(image: Image.Image) -> dict:
     """
-    영수증 이미지에서 OCR로 정보를 추출합니다.
-    EasyOCR → pytesseract → 시연용 더미 순으로 폴백합니다.
+    Claude Vision API로 영수증 이미지를 분석합니다.
+    EasyOCR/pytesseract 없이도 정확한 인식이 가능합니다.
     """
+    try:
+        # 이미지 → base64 인코딩
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=90)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        city_list = ", ".join(list(DISTANCE_FROM_SEOUL.keys()))
+
+        prompt = f"""이 이미지는 하이패스 또는 톨게이트 영수증입니다.
+다음 항목을 정확히 추출해서 JSON으로만 답하세요. 다른 말은 하지 마세요.
+
+{{
+  "trip_date": "결제일자 (YYYY.MM.DD 형식, 없으면 오늘 날짜)",
+  "origin_gate": "출발 요금소명 (예: 서울TG, 한남요금소 등)",
+  "dest_gate": "도착 요금소명",
+  "toll_fee": 통행료 숫자만 (원 단위 정수, 쉼표 제외),
+  "origin_city": "출발 요금소에 해당하는 도시명. 다음 중 하나로만 답하세요: {city_list}. 확실하지 않으면 null",
+  "dest_city": "도착 요금소에 해당하는 도시명. 다음 중 하나로만 답하세요: {city_list}. 확실하지 않으면 null"
+}}"""
+
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"Content-Type": "application/json"},
+            json={
+                "model": "claude-sonnet-4-20250514",
+                "max_tokens": 400,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                        {"type": "text",  "text": prompt},
+                    ],
+                }],
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["content"][0]["text"].strip()
+
+        # JSON 파싱
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not json_match:
+            raise ValueError("JSON not found in response")
+        data = json.loads(json_match.group())
+
+        # 날짜 포맷 정규화
+        trip_date = str(data.get("trip_date") or datetime.date.today().strftime("%Y.%m.%d"))
+        trip_date = re.sub(r"[-/]", ".", trip_date)
+
+        # 통행료 정수화
+        raw_toll = data.get("toll_fee", 0)
+        toll_fee = int(str(raw_toll).replace(",", "").replace("원", "")) if raw_toll else 0
+
+        origin_gate = str(data.get("origin_gate") or "출발요금소")
+        dest_gate   = str(data.get("dest_gate")   or "도착요금소")
+
+        # AI가 직접 도시명 반환 → 검증 후 사용, 실패 시 역매핑 폴백
+        cities = list(DISTANCE_FROM_SEOUL.keys())
+        origin_city = data.get("origin_city")
+        dest_city   = data.get("dest_city")
+        if origin_city not in cities: origin_city = gate_to_city(origin_gate)
+        if dest_city   not in cities: dest_city   = gate_to_city(dest_gate)
+
+        return {
+            "trip_date":   trip_date,
+            "toll_fee":    toll_fee,
+            "origin_gate": origin_gate,
+            "dest_gate":   dest_gate,
+            "origin_city": origin_city,
+            "dest_city":   dest_city,
+            "ocr_text":    raw[:300],
+            "method":      "Claude Vision AI",
+        }
+
+    except Exception as e:
+        return None  # 폴백 신호
+
+
+def mock_ocr_receipt(image: Image.Image) -> dict:
+    """
+    영수증 분석: Claude Vision → EasyOCR → pytesseract → 더미 순 폴백
+    """
+    # 1순위: Claude Vision API
+    result = analyze_receipt_with_claude(image)
+    if result:
+        return result
+
+    # 2순위: EasyOCR
     try:
         import easyocr
         reader = easyocr.Reader(["ko", "en"], gpu=False)
-        img_array = np.array(image)
-        results = reader.readtext(img_array)
+        results = reader.readtext(np.array(image))
         text = " ".join([r[1] for r in results])
         parsed = parse_ocr_text(text)
         return {**parsed, "ocr_text": text[:300], "method": "EasyOCR"}
-    except ImportError:
+    except Exception:
         pass
 
+    # 3순위: pytesseract
     try:
         import pytesseract
         text = pytesseract.image_to_string(image, lang="kor+eng")
@@ -487,16 +553,16 @@ def mock_ocr_receipt(image) -> dict:
     except Exception:
         pass
 
-    # 시연용 더미 — OCR 라이브러리 없을 때
+    # 최종 더미
     return {
-        "trip_date":    datetime.date.today().strftime("%Y.%m.%d"),
-        "toll_fee":     2400,
-        "origin_gate":  "서울TG",
-        "dest_gate":    "수원TG",
-        "origin_city":  "서울",
-        "dest_city":    "수원",
-        "ocr_text":     "(시연용) OCR 라이브러리 미설치 - 더미 데이터",
-        "method":       "Demo",
+        "trip_date":   datetime.date.today().strftime("%Y.%m.%d"),
+        "toll_fee":    2400,
+        "origin_gate": "서울TG",
+        "dest_gate":   "수원TG",
+        "origin_city": "서울",
+        "dest_city":   "수원",
+        "ocr_text":    "(더미) Vision AI 및 OCR 라이브러리 미사용 — 네트워크 오류",
+        "method":      "Demo",
     }
 
 
@@ -750,59 +816,73 @@ with tab1:
             img = Image.open(receipt_file)
             st.image(img, caption="업로드된 영수증", use_container_width=True)
 
-            with st.spinner("🔍 OCR 분석 중..."):
+            with st.spinner("🔍 영수증 분석 중... (Claude Vision AI 사용)"):
                 result = mock_ocr_receipt(img)
             st.session_state.ocr_result = result
 
-            st.success(f"✅ OCR 완료 (엔진: {result['method']})")
+            # 분석 방법 배지
+            method = result.get("method", "")
+            if "Claude" in method:
+                st.success(f"✅ {method}로 자동 인식 완료")
+            elif method == "Demo":
+                st.warning("⚠️ 시연용 더미 데이터 (Vision AI 연결 필요)")
+            else:
+                st.info(f"ℹ️ {method}로 인식")
+
+            # 추출 결과 카드
             c1, c2 = st.columns(2)
             with c1:
-                st.metric("결제일자",   result["trip_date"])
-                st.metric("출발요금소", result["origin_gate"])
+                st.metric("결제일자",    result["trip_date"])
+                st.metric("출발 요금소", result["origin_gate"])
             with c2:
-                st.metric("통행료(편도)", f"{result['toll_fee']:,}원")
-                st.metric("도착요금소", result["dest_gate"])
+                st.metric("통행료 (편도)", f"{result['toll_fee']:,}원")
+                st.metric("도착 요금소",  result["dest_gate"])
 
-            st.info("ℹ️ 통행료는 **편도 기준**으로 추출됩니다. 아래 통행료 입력란에 왕복(×2) 금액이 자동 반영됩니다.")
+            # 도시 인식 결과
+            if result.get("origin_city") or result.get("dest_city"):
+                st.markdown("**🗺️ 출발지·목적지 자동 인식 →** 아래 셀렉트박스에 반영됩니다")
+                ca, cb = st.columns(2)
+                with ca:
+                    if result.get("origin_city"):
+                        st.success(f"출발지: **{result['origin_city']}**")
+                with cb:
+                    if result.get("dest_city"):
+                        st.success(f"목적지: **{result['dest_city']}**")
 
-            if result["ocr_text"]:
-                with st.expander("📝 OCR 원문 보기"):
+            st.caption("💡 통행료는 편도 기준으로 추출되며, 왕복(×2)이 자동 반영됩니다.")
+
+            if result.get("ocr_text"):
+                with st.expander("📝 원문 보기"):
                     st.text(result["ocr_text"])
 
-            # 통행료: 왕복(×2) 자동 반영
-            st.session_state.toll_fee  = result["toll_fee"] * 2
-            st.session_state.trip_date = result["trip_date"]
-
-            # 출발지/목적지 자동 반영
+            # 세션 상태 저장 — 통행료 왕복(×2)
+            st.session_state.toll_fee       = result["toll_fee"] * 2
+            st.session_state.trip_date      = result["trip_date"]
             if result.get("origin_city"):
                 st.session_state.ocr_origin_city = result["origin_city"]
-                st.success(f"🗺️ 출발지 자동 인식: **{result['origin_city']}** (요금소: {result['origin_gate']})")
             if result.get("dest_city"):
                 st.session_state.ocr_dest_city = result["dest_city"]
-                st.success(f"🗺️ 목적지 자동 인식: **{result['dest_city']}** (요금소: {result['dest_gate']})")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
         # ── 출발지 / 목적지 ────────────────────────────────────
         st.markdown('<div class="card"><div class="card-title">② 출발지 · 목적지 설정</div>', unsafe_allow_html=True)
 
-        if "ocr_origin_city" in st.session_state or "ocr_dest_city" in st.session_state:
-            st.caption("✅ 영수증 OCR에서 자동 인식된 값이 반영되었습니다. 필요 시 수정하세요.")
-
         cities = list(DISTANCE_FROM_SEOUL.keys())
+        ocr_origin = st.session_state.get("ocr_origin_city")
+        ocr_dest   = st.session_state.get("ocr_dest_city")
 
-        # OCR 인식 도시를 기본값으로 사용
-        ocr_origin = st.session_state.pop("ocr_origin_city", None)
-        ocr_dest   = st.session_state.pop("ocr_dest_city", None)
+        if ocr_origin or ocr_dest:
+            st.caption("✅ 영수증에서 자동 인식된 값이 반영되었습니다. 필요 시 수정하세요.")
 
         origin_default = cities.index(ocr_origin) if ocr_origin and ocr_origin in cities else cities.index("서울")
         dest_default   = cities.index(ocr_dest)   if ocr_dest   and ocr_dest   in cities else (cities.index("수원") if "수원" in cities else 1)
 
         c1, c2 = st.columns(2)
         with c1:
-            origin = st.selectbox("출발지", cities, index=origin_default)
+            origin = st.selectbox("출발지", cities, index=origin_default, key="sel_origin")
         with c2:
-            destination = st.selectbox("목적지", cities, index=dest_default)
+            destination = st.selectbox("목적지", cities, index=dest_default, key="sel_dest")
 
         st.session_state.destination = destination
         st.session_state.dest_coord  = DESTINATION_COORDS.get(destination, (37.5665, 126.9780))
@@ -865,33 +945,46 @@ with tab1:
         st.session_state.fuel_cost  = fuel_cost
         st.session_state.total_cost = total_cost
 
+        # 비용 breakdown 카드 3개
         c1, c2, c3 = st.columns(3)
         with c1:
             st.markdown(f"""
             <div class="metric-box">
               <div class="metric-label">유류비</div>
               <div class="metric-value" style="font-size:1.2rem">{fuel_cost:,.0f}원</div>
+              <div style="font-size:0.75rem;color:#888;margin-top:3px">{distance_km/efficiency:.1f}L 소비</div>
             </div>""", unsafe_allow_html=True)
         with c2:
             st.markdown(f"""
             <div class="metric-box">
-              <div class="metric-label">통행료</div>
-              <div class="metric-value" style="font-size:1.2rem">{toll:,}원</div>
+              <div class="metric-label">통행료 (왕복)</div>
+              <div class="metric-value" style="font-size:1.2rem">{toll:,.0f}원</div>
+              <div style="font-size:0.75rem;color:#888;margin-top:3px">편도 {toll//2:,}원 × 2</div>
             </div>""", unsafe_allow_html=True)
         with c3:
             st.markdown(f"""
             <div class="metric-box">
-              <div class="metric-label">거리/연비</div>
-              <div class="metric-value" style="font-size:1.2rem">{distance_km/efficiency:.1f}L</div>
+              <div class="metric-label">왕복 거리</div>
+              <div class="metric-value" style="font-size:1.2rem">{distance_km:.0f}km</div>
+              <div style="font-size:0.75rem;color:#888;margin-top:3px">편도 {distance_km/2:.0f}km</div>
             </div>""", unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
+
+        # 최종 금액 — 내역 포함
+        fuel_pct = int(fuel_cost / total_cost * 100) if total_cost > 0 else 0
+        toll_pct = 100 - fuel_pct
         st.markdown(f"""
         <div class="final-amount">
-          <div class="label">💰 최종 청구 금액</div>
+          <div class="label">💰 최종 청구 금액 (유류비 + 통행료)</div>
           <div class="amount">{total_cost:,.0f} 원</div>
-          <div style="color:#388e3c;font-size:0.8rem;margin-top:4px">
-            ({distance_km}km × 왕복 ÷ {efficiency}km/L × {st.session_state.fuel_price:,}원/L + 통행료 {toll:,}원)
+          <div style="display:flex;justify-content:center;gap:16px;margin-top:8px;font-size:0.8rem">
+            <span style="color:#388e3c">유류비 {fuel_cost:,.0f}원 ({fuel_pct}%)</span>
+            <span style="color:#888">+</span>
+            <span style="color:#1565c0">통행료 {toll:,.0f}원 ({toll_pct}%)</span>
+          </div>
+          <div style="color:#388e3c;font-size:0.75rem;margin-top:4px">
+            ({distance_km}km ÷ {efficiency}km/L × {int(st.session_state.fuel_price):,}원/L) + 통행료 왕복
           </div>
         </div>
         """, unsafe_allow_html=True)
