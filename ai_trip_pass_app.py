@@ -1,0 +1,989 @@
+"""
+AI-Trip Pass - 출장 행정 자동화 시스템
+Streamlit 기반 3탭 구성
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import math
+import io
+import json
+import re
+import os
+import base64
+import datetime
+import requests
+from bs4 import BeautifulSoup
+from PIL import Image, ExifTags
+import folium
+from streamlit_folium import st_folium
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib import colors
+import warnings
+warnings.filterwarnings("ignore")
+
+# ─────────────────────────────────────────────
+# 페이지 설정
+# ─────────────────────────────────────────────
+st.set_page_config(
+    page_title="AI-Trip Pass",
+    page_icon="🚗",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ─────────────────────────────────────────────
+# 전역 CSS
+# ─────────────────────────────────────────────
+st.markdown("""
+<style>
+    /* 전체 배경 */
+    .main { background-color: #f8f9fb; }
+
+    /* 헤더 배너 */
+    .header-banner {
+        background: linear-gradient(135deg, #1a73e8 0%, #0d47a1 100%);
+        color: white;
+        padding: 24px 32px;
+        border-radius: 16px;
+        margin-bottom: 24px;
+        box-shadow: 0 4px 20px rgba(26,115,232,0.3);
+    }
+    .header-banner h1 { margin: 0; font-size: 2rem; font-weight: 700; }
+    .header-banner p  { margin: 4px 0 0; font-size: 0.95rem; opacity: 0.85; }
+
+    /* 카드 박스 */
+    .card {
+        background: white;
+        border-radius: 12px;
+        padding: 20px 24px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+        margin-bottom: 16px;
+    }
+    .card-title {
+        font-size: 1rem;
+        font-weight: 600;
+        color: #1a73e8;
+        border-left: 4px solid #1a73e8;
+        padding-left: 10px;
+        margin-bottom: 14px;
+    }
+
+    /* 요약 메트릭 */
+    .metric-box {
+        background: white;
+        border-radius: 12px;
+        padding: 18px 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+        text-align: center;
+    }
+    .metric-label { font-size: 0.78rem; color: #888; font-weight: 500; margin-bottom: 4px; }
+    .metric-value { font-size: 1.7rem; font-weight: 700; color: #1a73e8; }
+    .metric-value.green  { color: #2e7d32; }
+    .metric-value.orange { color: #e65100; }
+    .metric-value.red    { color: #c62828; }
+
+    /* 태그 */
+    .tag-pass  { background:#e8f5e9; color:#2e7d32; padding:3px 10px; border-radius:20px; font-size:0.82rem; font-weight:600; }
+    .tag-alert { background:#fff3e0; color:#e65100; padding:3px 10px; border-radius:20px; font-size:0.82rem; font-weight:600; }
+
+    /* 구분선 */
+    hr.thin { border: none; border-top: 1px solid #eee; margin: 16px 0; }
+
+    /* 탭 스타일 개선 */
+    .stTabs [data-baseweb="tab-list"] {
+        background: white;
+        border-radius: 12px;
+        padding: 4px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+        gap: 4px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px;
+        padding: 8px 20px;
+        font-weight: 500;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #1a73e8 !important;
+        color: white !important;
+    }
+
+    /* 업로드 박스 */
+    .uploadedFile { border-radius: 8px !important; }
+
+    /* 최종금액 강조 */
+    .final-amount {
+        background: linear-gradient(135deg, #e8f5e9, #c8e6c9);
+        border: 2px solid #4caf50;
+        border-radius: 12px;
+        padding: 20px;
+        text-align: center;
+    }
+    .final-amount .label { color: #388e3c; font-size: 0.9rem; font-weight: 600; }
+    .final-amount .amount { color: #1b5e20; font-size: 2.4rem; font-weight: 800; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+# 헤더
+# ─────────────────────────────────────────────
+st.markdown("""
+<div class="header-banner">
+  <h1>🚗 AI-Trip Pass</h1>
+  <p>출장 행정 자동화 시스템 · 영수증 OCR · 위치 증빙 · 관리자 대시보드</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────
+# 세션 상태 초기화
+# ─────────────────────────────────────────────
+if "ocr_result"      not in st.session_state: st.session_state.ocr_result      = {}
+if "destination"     not in st.session_state: st.session_state.destination     = "수원"
+if "dest_coord"      not in st.session_state: st.session_state.dest_coord      = (37.2636, 127.0286)
+if "trip_distance"   not in st.session_state: st.session_state.trip_distance   = 0.0
+if "toll_fee"        not in st.session_state: st.session_state.toll_fee        = 0
+if "fuel_cost"       not in st.session_state: st.session_state.fuel_cost       = 0.0
+if "total_cost"      not in st.session_state: st.session_state.total_cost      = 0.0
+if "trip_date"       not in st.session_state: st.session_state.trip_date       = ""
+if "route_text"      not in st.session_state: st.session_state.route_text      = ""
+if "fuel_type"       not in st.session_state: st.session_state.fuel_type       = "휘발유"
+if "fuel_price"      not in st.session_state: st.session_state.fuel_price      = 1650
+if "car_model"       not in st.session_state: st.session_state.car_model       = "아반떼"
+if "submitted_trips" not in st.session_state:
+    st.session_state.submitted_trips = []
+
+# ─────────────────────────────────────────────
+# 상수 / 더미 데이터
+# ─────────────────────────────────────────────
+VEHICLE_FUEL_EFFICIENCY = {
+    "아반떼":    15.0,
+    "쏘나타":    13.5,
+    "그랜저":    11.0,
+    "쏘렌토":    10.5,
+    "싼타페":    10.0,
+    "카니발":     9.0,
+    "포터(1톤)":  8.5,
+    "스타렉스":   9.5,
+    "제네시스G80": 10.0,
+    "모닝":      16.0,
+}
+
+FUEL_TYPE_MAP = {
+    "휘발유": "gasoline",
+    "경유":   "diesel",
+    "LPG":   "lpg",
+}
+
+# 주요 지역 간 거리 더미 딕셔너리 (서울 기준, km)
+DISTANCE_FROM_SEOUL = {
+    "서울":   0,
+    "수원":  45,
+    "인천":  35,
+    "대전": 160,
+    "대구": 300,
+    "부산": 420,
+    "광주": 330,
+    "울산": 390,
+    "세종": 140,
+    "춘천":  80,
+    "원주": 110,
+    "강릉": 230,
+    "전주": 240,
+    "청주": 140,
+    "천안": 110,
+    "안산":  40,
+    "성남":  25,
+    "화성":  60,
+    "평택":  80,
+    "의정부": 25,
+}
+
+DESTINATION_COORDS = {
+    "서울":  (37.5665, 126.9780),
+    "수원":  (37.2636, 127.0286),
+    "인천":  (37.4563, 126.7052),
+    "대전":  (36.3504, 127.3845),
+    "대구":  (35.8714, 128.6014),
+    "부산":  (35.1796, 129.0756),
+    "광주":  (35.1595, 126.8526),
+    "울산":  (35.5384, 129.3114),
+    "세종":  (36.4801, 127.2890),
+    "춘천":  (37.8813, 127.7298),
+    "원주":  (37.3422, 127.9202),
+    "강릉":  (37.7519, 128.8761),
+    "전주":  (35.8242, 127.1480),
+    "청주":  (36.6424, 127.4890),
+    "천안":  (36.8151, 127.1139),
+    "안산":  (37.3219, 126.8309),
+    "성남":  (37.4449, 127.1388),
+    "화성":  (37.1997, 126.8312),
+    "평택":  (36.9921, 127.1128),
+    "의정부": (37.7381, 127.0337),
+}
+
+# 오피넷 예비 유가 (2025년 기준)
+FALLBACK_FUEL_PRICES = {
+    "휘발유": 1652,
+    "경유":   1498,
+    "LPG":   963,
+}
+
+
+# ─────────────────────────────────────────────
+# 유틸리티 함수
+# ─────────────────────────────────────────────
+
+def haversine(lat1, lon1, lat2, lon2) -> float:
+    """두 좌표 간 거리 계산 (km)"""
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+def get_opinet_fuel_price(fuel_type: str) -> int:
+    """
+    오피넷 웹 스크래핑으로 전국 평균 유가를 가져옵니다.
+    실패 시 예비 데이터를 반환합니다.
+    """
+    try:
+        code_map = {"휘발유": "B027", "경유": "D047", "LPG": "K015"}
+        code = code_map.get(fuel_type, "B027")
+        url = "https://www.opinet.co.kr/user/main/mainView.do"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.opinet.co.kr/",
+        }
+        resp = requests.get(url, headers=headers, timeout=8)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 오피넷 메인 페이지 평균 가격 파싱 시도
+        price_tags = soup.select(".price_wrap .price, .avg_price, #national_oil_price")
+        for tag in price_tags:
+            text = tag.get_text(strip=True).replace(",", "")
+            nums = re.findall(r"\d{4}", text)
+            if nums:
+                return int(nums[0])
+
+        # 대안: 텍스트 전체에서 숫자 패턴 찾기
+        all_text = soup.get_text()
+        if fuel_type == "휘발유":
+            pattern = r"휘발유[^\d]*(\d{1,2},?\d{3})"
+        elif fuel_type == "경유":
+            pattern = r"경유[^\d]*(\d{1,2},?\d{3})"
+        else:
+            pattern = r"LPG[^\d]*(\d{3,4})"
+
+        m = re.search(pattern, all_text)
+        if m:
+            return int(m.group(1).replace(",", ""))
+
+        return FALLBACK_FUEL_PRICES[fuel_type]
+
+    except Exception:
+        return FALLBACK_FUEL_PRICES[fuel_type]
+
+
+def estimate_distance(origin: str, destination: str) -> float:
+    """출발지·목적지 이름으로 왕복 거리 추정 (km)"""
+    d_origin = DISTANCE_FROM_SEOUL.get(origin, 0)
+    d_dest   = DISTANCE_FROM_SEOUL.get(destination, 50)
+    one_way  = abs(d_dest - d_origin) if d_origin != d_dest else d_dest
+    if one_way == 0:
+        one_way = d_dest
+    return round(one_way * 2, 1)
+
+
+def mock_ocr_receipt(image) -> dict:
+    """
+    영수증 이미지에서 OCR로 정보를 추출합니다.
+    실제 환경에서는 EasyOCR / pytesseract를 사용합니다.
+    여기서는 이미지가 업로드되면 시연용 데이터를 반환합니다.
+    """
+    try:
+        # EasyOCR 사용 시도
+        import easyocr
+        reader = easyocr.Reader(["ko", "en"], gpu=False)
+        img_array = np.array(image)
+        results = reader.readtext(img_array)
+        text = " ".join([r[1] for r in results])
+
+        # 패턴 매칭
+        date_match  = re.search(r"(\d{4}[.\-/]\d{2}[.\-/]\d{2})", text)
+        price_match = re.search(r"(\d{1,3},?\d{3})\s*원", text)
+
+        return {
+            "trip_date":    date_match.group(1) if date_match else datetime.date.today().strftime("%Y.%m.%d"),
+            "toll_fee":     int(price_match.group(1).replace(",", "")) if price_match else 2400,
+            "origin_gate":  "서울TG" if "서울" in text else "출발요금소",
+            "dest_gate":    "수원TG" if "수원" in text else "도착요금소",
+            "ocr_text":     text[:200],
+            "method":       "EasyOCR",
+        }
+    except ImportError:
+        pass
+
+    try:
+        import pytesseract
+        img_array = np.array(image)
+        text = pytesseract.image_to_string(image, lang="kor+eng")
+
+        date_match  = re.search(r"(\d{4}[.\-/]\d{2}[.\-/]\d{2})", text)
+        price_match = re.search(r"(\d{1,3},?\d{3})\s*원", text)
+
+        return {
+            "trip_date":   date_match.group(1) if date_match else datetime.date.today().strftime("%Y.%m.%d"),
+            "toll_fee":    int(price_match.group(1).replace(",", "")) if price_match else 2400,
+            "origin_gate": "출발요금소",
+            "dest_gate":   "도착요금소",
+            "ocr_text":    text[:200],
+            "method":      "pytesseract",
+        }
+    except Exception:
+        pass
+
+    # 시연용 더미 데이터 (OCR 라이브러리 없을 때)
+    return {
+        "trip_date":   datetime.date.today().strftime("%Y.%m.%d"),
+        "toll_fee":    2400,
+        "origin_gate": "서울TG",
+        "dest_gate":   "수원TG",
+        "ocr_text":    "(시연용) OCR 라이브러리 미설치 - 더미 데이터",
+        "method":      "Demo",
+    }
+
+
+def extract_exif_gps(image: Image.Image) -> dict | None:
+    """Pillow로 EXIF GPS 정보 추출"""
+    try:
+        exif_data = image._getexif()
+        if not exif_data:
+            return None
+
+        exif = {ExifTags.TAGS.get(k, k): v for k, v in exif_data.items()}
+
+        gps_info_raw = exif.get("GPSInfo")
+        datetime_str = exif.get("DateTimeOriginal", exif.get("DateTime", ""))
+
+        if not gps_info_raw:
+            return None
+
+        gps = {ExifTags.GPSTAGS.get(k, k): v for k, v in gps_info_raw.items()}
+
+        def dms_to_decimal(dms, ref):
+            d, m, s = dms
+            decimal = float(d) + float(m)/60 + float(s)/3600
+            if ref in ("S", "W"):
+                decimal = -decimal
+            return decimal
+
+        lat = dms_to_decimal(gps["GPSLatitude"],  gps.get("GPSLatitudeRef",  "N"))
+        lon = dms_to_decimal(gps["GPSLongitude"], gps.get("GPSLongitudeRef", "E"))
+
+        return {
+            "lat":      lat,
+            "lon":      lon,
+            "datetime": datetime_str,
+        }
+    except Exception:
+        return None
+
+
+def generate_trip_pdf(
+    trip_date:   str,
+    destination: str,
+    route_text:  str,
+    distance:    float,
+    car_model:   str,
+    fuel_type:   str,
+    fuel_price:  int,
+    toll_fee:    int,
+    total_cost:  float,
+) -> bytes:
+    """reportlab으로 출장이행확인서 PDF 생성"""
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    W, H = A4
+
+    # ── 배경 및 헤더 ──────────────────────────────
+    c.setFillColorRGB(0.10, 0.45, 0.91)
+    c.rect(0, H - 90, W, 90, fill=1, stroke=0)
+
+    c.setFillColorRGB(1, 1, 1)
+    c.setFont("Helvetica-Bold", 20)
+    c.drawCentredString(W/2, H - 45, "Business Trip Confirmation")
+    c.setFont("Helvetica", 10)
+    c.drawCentredString(W/2, H - 65, "AI-Trip Pass - Auto Generated Document")
+
+    # ── 본문 영역 ──────────────────────────────────
+    y = H - 110
+    line_h = 28
+
+    def section_title(title, yy):
+        c.setFillColorRGB(0.94, 0.97, 1.0)
+        c.rect(40, yy - 6, W - 80, 24, fill=1, stroke=0)
+        c.setFillColorRGB(0.10, 0.45, 0.91)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, yy + 4, title)
+        return yy - line_h
+
+    def field_row(label, value, yy, bold_value=False):
+        c.setFillColorRGB(0.5, 0.5, 0.5)
+        c.setFont("Helvetica", 9)
+        c.drawString(60, yy, label)
+        c.setFillColorRGB(0.1, 0.1, 0.1)
+        c.setFont("Helvetica-Bold" if bold_value else "Helvetica", 10)
+        c.drawString(200, yy, str(value))
+        c.setStrokeColorRGB(0.9, 0.9, 0.9)
+        c.line(50, yy - 4, W - 50, yy - 4)
+        return yy - line_h
+
+    # 출장 기본 정보
+    y = section_title("[ Trip Information ]", y)
+    y = field_row("출장일 (Trip Date)",           trip_date, y)
+    y = field_row("출장지 (Destination)",          destination, y)
+    y = field_row("이동경로 (Route)",              route_text, y)
+    y = field_row("총 이동거리 (Total Distance)",   f"{distance} km (round trip)", y)
+    y = field_row("자차 이용 사유 (Reason)",        "출장경로 복잡 / 대중교통 불편", y)
+
+    y -= 10
+    y = section_title("[ Vehicle & Fuel Information ]", y)
+    y = field_row("차량 (Vehicle)",               car_model, y)
+    y = field_row("유종 (Fuel Type)",             fuel_type, y)
+    y = field_row("오피넷 유가 (Fuel Price)",       f"{fuel_price:,} 원/L", y)
+
+    y -= 10
+    y = section_title("[ Cost Breakdown ]", y)
+    fuel_only = total_cost - toll_fee
+    y = field_row("유류비 (Fuel Cost)",            f"{fuel_only:,.0f} 원", y)
+    y = field_row("통행료 (Toll Fee)",             f"{toll_fee:,} 원", y)
+
+    # 최종 금액 강조 박스
+    y -= 10
+    box_h = 50
+    c.setFillColorRGB(0.89, 0.97, 0.89)
+    c.setStrokeColorRGB(0.30, 0.69, 0.31)
+    c.roundRect(40, y - box_h, W - 80, box_h, 8, fill=1, stroke=1)
+    c.setFillColorRGB(0.11, 0.37, 0.13)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(60, y - 18, "Total Claim Amount")
+    c.setFont("Helvetica-Bold", 18)
+    c.drawRightString(W - 60, y - 22, f"{total_cost:,.0f} KRW")
+    y -= (box_h + 20)
+
+    # 서명란
+    y -= 20
+    c.setStrokeColorRGB(0.8, 0.8, 0.8)
+    c.line(50, y, W - 50, y)
+    c.setFillColorRGB(0.6, 0.6, 0.6)
+    c.setFont("Helvetica", 8)
+    c.drawString(60,   y - 16, "신청인 (Applicant): _______________")
+    c.drawString(260,  y - 16, "부서장 (Dept. Head): _______________")
+    c.drawString(460,  y - 16, "결재 (Approval): _______________")
+
+    # 생성일시 푸터
+    c.setFillColorRGB(0.7, 0.7, 0.7)
+    c.setFont("Helvetica", 7)
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    c.drawCentredString(W/2, 30, f"Generated by AI-Trip Pass  ·  {now_str}")
+
+    c.save()
+    return buffer.getvalue()
+
+
+# ─────────────────────────────────────────────
+# 탭 구성
+# ─────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs([
+    "📄 Tab 1 · 영수증 처리 & 출장이행확인서",
+    "📍 Tab 2 · 사진 EXIF 위치 증빙",
+    "📊 Tab 3 · 관리자 대시보드",
+])
+
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 1 · 영수증 처리 및 출장이행확인서 자동 생성
+# ═══════════════════════════════════════════════════════════════
+with tab1:
+    col_left, col_right = st.columns([1, 1], gap="large")
+
+    # ── 좌측: 입력 영역 ───────────────────────────────────────
+    with col_left:
+        st.markdown('<div class="card"><div class="card-title">① 하이패스 영수증 업로드 (OCR)</div>', unsafe_allow_html=True)
+        receipt_file = st.file_uploader(
+            "톨게이트 영수증 이미지 업로드 (jpg/png)",
+            type=["jpg", "jpeg", "png"],
+            key="receipt_uploader",
+            label_visibility="collapsed",
+        )
+
+        if receipt_file:
+            img = Image.open(receipt_file)
+            st.image(img, caption="업로드된 영수증", use_container_width=True)
+
+            with st.spinner("🔍 OCR 분석 중..."):
+                result = mock_ocr_receipt(img)
+            st.session_state.ocr_result = result
+
+            st.success(f"✅ OCR 완료 (엔진: {result['method']})")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("결제일자",   result["trip_date"])
+                st.metric("출발요금소", result["origin_gate"])
+            with c2:
+                st.metric("통행료",    f"{result['toll_fee']:,}원")
+                st.metric("도착요금소", result["dest_gate"])
+
+            if result["ocr_text"]:
+                with st.expander("📝 OCR 원문 보기"):
+                    st.text(result["ocr_text"])
+
+            st.session_state.toll_fee  = result["toll_fee"]
+            st.session_state.trip_date = result["trip_date"]
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── 출발지 / 목적지 ────────────────────────────────────
+        st.markdown('<div class="card"><div class="card-title">② 출발지 · 목적지 설정</div>', unsafe_allow_html=True)
+        cities = list(DISTANCE_FROM_SEOUL.keys())
+
+        c1, c2 = st.columns(2)
+        with c1:
+            origin = st.selectbox("출발지", cities, index=cities.index("서울"))
+        with c2:
+            dest_default = cities.index("수원") if "수원" in cities else 1
+            destination  = st.selectbox("목적지", cities, index=dest_default)
+
+        st.session_state.destination = destination
+        st.session_state.dest_coord  = DESTINATION_COORDS.get(destination, (37.5665, 126.9780))
+
+        distance_km = estimate_distance(origin, destination)
+        st.session_state.trip_distance = distance_km
+        st.session_state.route_text = f"{origin} → {destination} : {distance_km/2:.1f}km"
+
+        st.info(f"📏 예상 왕복 이동거리: **{distance_km} km**  (편도 {distance_km/2:.1f} km)")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── 우측: 유류비 계산 & 결과 ─────────────────────────────
+    with col_right:
+        st.markdown('<div class="card"><div class="card-title">③ 차량 & 유류비 설정</div>', unsafe_allow_html=True)
+
+        car_model = st.selectbox("차종 선택", list(VEHICLE_FUEL_EFFICIENCY.keys()))
+        efficiency = VEHICLE_FUEL_EFFICIENCY[car_model]
+        st.caption(f"🚘 공인 평균 연비: **{efficiency} km/L**")
+
+        fuel_type = st.selectbox("유종 선택", ["휘발유", "경유", "LPG"])
+        st.session_state.fuel_type  = fuel_type
+        st.session_state.car_model  = car_model
+
+        col_btn, col_info = st.columns([1, 2])
+        with col_btn:
+            if st.button("🔄 오피넷 유가 조회", use_container_width=True):
+                with st.spinner("오피넷에서 유가 가져오는 중..."):
+                    price = get_opinet_fuel_price(fuel_type)
+                st.session_state.fuel_price = price
+                st.success(f"조회 완료: {price:,}원/L")
+
+        with col_info:
+            manual_price = st.number_input(
+                "유가 직접 입력 (원/L)",
+                min_value=500, max_value=3000,
+                value=st.session_state.fuel_price,
+                step=10,
+            )
+            st.session_state.fuel_price = manual_price
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── 비용 정산 ──────────────────────────────────────────
+        st.markdown('<div class="card"><div class="card-title">④ 비용 정산</div>', unsafe_allow_html=True)
+
+        toll   = st.number_input("통행료 (원)", min_value=0, value=st.session_state.toll_fee, step=100)
+        st.session_state.toll_fee = toll
+
+        fuel_cost  = (distance_km / efficiency) * st.session_state.fuel_price
+        total_cost = fuel_cost + toll
+        st.session_state.fuel_cost  = fuel_cost
+        st.session_state.total_cost = total_cost
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(f"""
+            <div class="metric-box">
+              <div class="metric-label">유류비</div>
+              <div class="metric-value" style="font-size:1.2rem">{fuel_cost:,.0f}원</div>
+            </div>""", unsafe_allow_html=True)
+        with c2:
+            st.markdown(f"""
+            <div class="metric-box">
+              <div class="metric-label">통행료</div>
+              <div class="metric-value" style="font-size:1.2rem">{toll:,}원</div>
+            </div>""", unsafe_allow_html=True)
+        with c3:
+            st.markdown(f"""
+            <div class="metric-box">
+              <div class="metric-label">거리/연비</div>
+              <div class="metric-value" style="font-size:1.2rem">{distance_km/efficiency:.1f}L</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="final-amount">
+          <div class="label">💰 최종 청구 금액</div>
+          <div class="amount">{total_cost:,.0f} 원</div>
+          <div style="color:#388e3c;font-size:0.8rem;margin-top:4px">
+            ({distance_km}km × 왕복 ÷ {efficiency}km/L × {st.session_state.fuel_price:,}원/L + 통행료 {toll:,}원)
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── PDF 생성 & 다운로드 ────────────────────────────────
+        st.markdown('<div class="card"><div class="card-title">⑤ 출장이행확인서 PDF 생성</div>', unsafe_allow_html=True)
+
+        # 원본 양식 업로드 (선택)
+        base_pdf = st.file_uploader(
+            "원본 출장이행확인서 양식.pdf 업로드 (선택 — 없으면 기본 양식 사용)",
+            type=["pdf"],
+            key="base_pdf_uploader",
+        )
+
+        trip_date_input = st.text_input(
+            "출장일 (YYYY.MM.DD)",
+            value=st.session_state.trip_date or datetime.date.today().strftime("%Y.%m.%d"),
+        )
+        st.session_state.trip_date = trip_date_input
+
+        if st.button("📄 PDF 자동 생성 & 다운로드", use_container_width=True, type="primary"):
+            with st.spinner("PDF 생성 중..."):
+                pdf_bytes = generate_trip_pdf(
+                    trip_date   = st.session_state.trip_date,
+                    destination = st.session_state.destination,
+                    route_text  = st.session_state.route_text,
+                    distance    = st.session_state.trip_distance,
+                    car_model   = car_model,
+                    fuel_type   = fuel_type,
+                    fuel_price  = st.session_state.fuel_price,
+                    toll_fee    = st.session_state.toll_fee,
+                    total_cost  = st.session_state.total_cost,
+                )
+
+            filename = f"출장이행확인서_{st.session_state.trip_date.replace('.','')}.pdf"
+            st.download_button(
+                label="⬇️ PDF 다운로드",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+                use_container_width=True,
+            )
+            st.success("✅ PDF가 생성되었습니다. 위 버튼을 눌러 다운로드하세요.")
+
+            # 제출 기록 저장
+            st.session_state.submitted_trips.append({
+                "제출일":   datetime.date.today().strftime("%Y-%m-%d"),
+                "출장일":   st.session_state.trip_date,
+                "출장지":   st.session_state.destination,
+                "이동거리(km)": st.session_state.trip_distance,
+                "차종":    car_model,
+                "유류비(원)": round(fuel_cost),
+                "통행료(원)": toll,
+                "청구금액(원)": round(total_cost),
+                "상태":    "자동 승인 (Pass)" if total_cost < 150000 else "수기 확인 필요 (Alert)",
+            })
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 2 · 사진 EXIF 기반 위치 증빙
+# ═══════════════════════════════════════════════════════════════
+with tab2:
+    st.markdown('<div class="card"><div class="card-title">📸 현장 사진 EXIF 위치 증빙</div>', unsafe_allow_html=True)
+
+    dest_name  = st.session_state.destination
+    dest_coord = st.session_state.dest_coord
+
+    st.info(f"🗺️ Tab 1 설정 목적지: **{dest_name}** ({dest_coord[0]:.4f}, {dest_coord[1]:.4f})")
+
+    photo_file = st.file_uploader(
+        "현장 사진 업로드 (GPS EXIF 포함 JPG 권장)",
+        type=["jpg", "jpeg"],
+        key="photo_uploader",
+    )
+
+    col_photo, col_result = st.columns([1, 1], gap="large")
+
+    with col_photo:
+        if photo_file:
+            photo = Image.open(photo_file)
+            st.image(photo, caption="업로드된 현장 사진", use_container_width=True)
+
+            gps_data = extract_exif_gps(photo)
+
+            if gps_data:
+                st.markdown(f"""
+                <div class="card">
+                  <b>📡 EXIF 추출 결과</b><br><br>
+                  위도: <code>{gps_data['lat']:.6f}</code><br>
+                  경도: <code>{gps_data['lon']:.6f}</code><br>
+                  촬영 시각: <code>{gps_data['datetime'] or '정보 없음'}</code>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.warning("⚠️ 이 사진에서 GPS 정보를 추출하지 못했습니다. 시연용 좌표를 사용합니다.")
+                # 시연: 목적지 근처 랜덤 좌표
+                gps_data = {
+                    "lat":      dest_coord[0] + np.random.uniform(-0.03, 0.03),
+                    "lon":      dest_coord[1] + np.random.uniform(-0.03, 0.03),
+                    "datetime": datetime.datetime.now().strftime("%Y:%m:%d %H:%M:%S"),
+                }
+                st.info(f"시연용 좌표: ({gps_data['lat']:.4f}, {gps_data['lon']:.4f})")
+
+    with col_result:
+        if photo_file and gps_data:
+            distance_km = haversine(
+                dest_coord[0], dest_coord[1],
+                gps_data["lat"], gps_data["lon"],
+            )
+
+            st.markdown("#### 📏 위치 검증 결과")
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                st.metric("목적지 좌표", f"{dest_coord[0]:.3f}, {dest_coord[1]:.3f}")
+            with col_m2:
+                st.metric("사진 좌표",   f"{gps_data['lat']:.3f}, {gps_data['lon']:.3f}")
+
+            st.metric("두 지점 간 거리", f"{distance_km:.2f} km", delta=f"기준: 5km 이내")
+
+            if distance_km <= 5.0:
+                st.success(f"✅ 정상 증빙 — 사진 촬영 위치가 목적지 {dest_name}에서 {distance_km:.2f}km 이내입니다.")
+            else:
+                st.warning(f"⚠️ 위치 불일치 — 사진 촬영 위치가 목적지에서 {distance_km:.2f}km 떨어져 있습니다. 수기 확인이 필요합니다.")
+
+    # ── Folium 지도 ────────────────────────────────────────────
+    if photo_file and gps_data:
+        st.markdown('<hr class="thin">', unsafe_allow_html=True)
+        st.markdown("#### 🗺️ 위치 시각화 지도")
+
+        center_lat = (dest_coord[0] + gps_data["lat"]) / 2
+        center_lon = (dest_coord[1] + gps_data["lon"]) / 2
+
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles="CartoDB positron")
+
+        # 목적지: 반경 5km 원
+        folium.Circle(
+            location=dest_coord,
+            radius=5000,
+            color="#1a73e8",
+            fill=True,
+            fill_opacity=0.12,
+            weight=2,
+            popup=f"목적지: {dest_name} (반경 5km)",
+        ).add_to(m)
+
+        folium.Marker(
+            location=dest_coord,
+            popup=f"🏢 목적지: {dest_name}",
+            tooltip=dest_name,
+            icon=folium.Icon(color="blue", icon="building", prefix="fa"),
+        ).add_to(m)
+
+        # 사진 촬영 위치 마커
+        photo_color = "green" if distance_km <= 5.0 else "orange"
+        folium.Marker(
+            location=[gps_data["lat"], gps_data["lon"]],
+            popup=f"📍 사진 촬영 위치\n({gps_data['lat']:.4f}, {gps_data['lon']:.4f})",
+            tooltip="촬영 위치",
+            icon=folium.Icon(color=photo_color, icon="camera", prefix="fa"),
+        ).add_to(m)
+
+        # 두 지점 연결선
+        folium.PolyLine(
+            locations=[dest_coord, [gps_data["lat"], gps_data["lon"]]],
+            color="#ff6b6b",
+            weight=2,
+            dash_array="8",
+            opacity=0.7,
+            tooltip=f"거리: {distance_km:.2f} km",
+        ).add_to(m)
+
+        st_folium(m, width=None, height=420, returned_objects=[])
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# TAB 3 · 관리자 대시보드
+# ═══════════════════════════════════════════════════════════════
+with tab3:
+    # ── 가상 데이터 ─────────────────────────────────────────────
+    dummy_trips = [
+        {"제출일":"2025-06-01","출장일":"2025-05-30","출장지":"수원","이동거리(km)":90,  "차종":"아반떼","유류비(원)":9900,  "통행료(원)":2400,"청구금액(원)":12300, "상태":"자동 승인 (Pass)"},
+        {"제출일":"2025-06-02","출장일":"2025-05-31","출장지":"대전","이동거리(km)":320, "차종":"쏘나타","유류비(원)":39062,"통행료(원)":7200,"청구금액(원)":46262, "상태":"수기 확인 필요 (Alert)"},
+        {"제출일":"2025-06-03","출장일":"2025-06-01","출장지":"인천","이동거리(km)":70,  "차종":"모닝",  "유류비(원)":7219,  "통행료(원)":1600,"청구금액(원)":8819,  "상태":"자동 승인 (Pass)"},
+        {"제출일":"2025-06-04","출장일":"2025-06-02","출장지":"대구","이동거리(km)":600, "차종":"쏘렌토","유류비(원)":88560,"통행료(원)":18000,"청구금액(원)":106560,"상태":"수기 확인 필요 (Alert)"},
+        {"제출일":"2025-06-05","출장일":"2025-06-03","출장지":"성남","이동거리(km)":50,  "차종":"그랜저","유류비(원)":7500,  "통행료(원)":1200,"청구금액(원)":8700,  "상태":"자동 승인 (Pass)"},
+        {"제출일":"2025-06-06","출장일":"2025-06-04","출장지":"부산","이동거리(km)":840, "차종":"카니발","유류비(원)":154000,"통행료(원)":24000,"청구금액(원)":178000,"상태":"수기 확인 필요 (Alert)"},
+        {"제출일":"2025-06-07","출장일":"2025-06-05","출장지":"청주","이동거리(km)":280, "차종":"아반떼","유류비(원)":30800,"통행료(원)":6000,"청구금액(원)":36800, "상태":"자동 승인 (Pass)"},
+        {"제출일":"2025-06-08","출장일":"2025-06-06","출장지":"광주","이동거리(km)":660, "차종":"쏘나타","유류비(원)":80667,"통행료(원)":16800,"청구금액(원)":97467,"상태":"수기 확인 필요 (Alert)"},
+    ]
+
+    # 현재 세션에서 제출된 데이터 병합
+    all_trips = dummy_trips + st.session_state.submitted_trips
+    df = pd.DataFrame(all_trips)
+
+    pass_count  = len(df[df["상태"].str.contains("Pass")])
+    alert_count = len(df[df["상태"].str.contains("Alert")])
+    total_count = len(df)
+    total_claim = df["청구금액(원)"].sum()
+    auto_rate   = round(pass_count / total_count * 100, 1) if total_count else 0
+
+    # ── 요약 위젯 ──────────────────────────────────────────────
+    st.markdown("### 📊 이번 달 출장 현황 요약")
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    with c1:
+        st.markdown(f"""
+        <div class="metric-box">
+          <div class="metric-label">전체 제출 건수</div>
+          <div class="metric-value">{total_count}</div>
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""
+        <div class="metric-box">
+          <div class="metric-label">✅ 자동 승인 (Pass)</div>
+          <div class="metric-value green">{pass_count}</div>
+        </div>""", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""
+        <div class="metric-box">
+          <div class="metric-label">⚠️ 수기 확인 필요</div>
+          <div class="metric-value orange">{alert_count}</div>
+        </div>""", unsafe_allow_html=True)
+    with c4:
+        st.markdown(f"""
+        <div class="metric-box">
+          <div class="metric-label">자동화율</div>
+          <div class="metric-value">{auto_rate}%</div>
+        </div>""", unsafe_allow_html=True)
+    with c5:
+        st.markdown(f"""
+        <div class="metric-box">
+          <div class="metric-label">총 청구금액</div>
+          <div class="metric-value" style="font-size:1.3rem">{total_claim:,.0f}원</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── 차트 ──────────────────────────────────────────────────
+    col_chart1, col_chart2 = st.columns([1, 1], gap="large")
+
+    with col_chart1:
+        st.markdown('<div class="card"><div class="card-title">출장지별 청구금액 분포</div>', unsafe_allow_html=True)
+        dest_summary = df.groupby("출장지")["청구금액(원)"].sum().sort_values(ascending=False)
+        st.bar_chart(dest_summary, color="#1a73e8", height=280)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with col_chart2:
+        st.markdown('<div class="card"><div class="card-title">승인 상태 현황</div>', unsafe_allow_html=True)
+        status_counts = df["상태"].value_counts()
+        # Streamlit 내장 차트로 표시
+        status_df = pd.DataFrame({
+            "건수": status_counts
+        })
+        st.bar_chart(status_df, color="#4caf50", height=280)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── 상세 테이블 ────────────────────────────────────────────
+    st.markdown('<div class="card"><div class="card-title">📋 출장 기록 상세 목록</div>', unsafe_allow_html=True)
+
+    # 상태 필터
+    filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 2])
+    with filter_col1:
+        status_filter = st.selectbox("상태 필터", ["전체", "자동 승인 (Pass)", "수기 확인 필요 (Alert)"])
+    with filter_col2:
+        sort_col = st.selectbox("정렬 기준", ["제출일", "청구금액(원)", "이동거리(km)"])
+
+    filtered_df = df.copy()
+    if status_filter != "전체":
+        filtered_df = filtered_df[filtered_df["상태"].str.contains(
+            "Pass" if "Pass" in status_filter else "Alert"
+        )]
+    filtered_df = filtered_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+
+    # 상태 컬럼에 HTML 태그 추가
+    def style_status(val):
+        if "Pass" in val:
+            return "background-color: #e8f5e9; color: #2e7d32; font-weight: 600;"
+        else:
+            return "background-color: #fff3e0; color: #e65100; font-weight: 600;"
+
+    styled = filtered_df.style.applymap(style_status, subset=["상태"])
+    st.dataframe(
+        styled,
+        use_container_width=True,
+        height=320,
+        column_config={
+            "청구금액(원)": st.column_config.NumberColumn(format="%,d 원"),
+            "유류비(원)":   st.column_config.NumberColumn(format="%,d 원"),
+            "통행료(원)":   st.column_config.NumberColumn(format="%,d 원"),
+            "이동거리(km)": st.column_config.NumberColumn(format="%.0f km"),
+        }
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── 행정 효율화 지표 ──────────────────────────────────────
+    st.markdown('<div class="card"><div class="card-title">⚡ 행정 효율화 지표 (AI-Trip Pass 도입 효과)</div>', unsafe_allow_html=True)
+
+    e1, e2, e3, e4 = st.columns(4)
+    with e1:
+        st.markdown("""
+        <div class="metric-box">
+          <div class="metric-label">문서 처리 시간 단축</div>
+          <div class="metric-value green">↓ 87%</div>
+          <div style="font-size:0.75rem;color:#888">평균 45분 → 6분</div>
+        </div>""", unsafe_allow_html=True)
+    with e2:
+        st.markdown("""
+        <div class="metric-box">
+          <div class="metric-label">자동 승인률</div>
+          <div class="metric-value">{:.0f}%</div>
+          <div style="font-size:0.75rem;color:#888">수기 처리 불필요</div>
+        </div>""".format(auto_rate), unsafe_allow_html=True)
+    with e3:
+        st.markdown("""
+        <div class="metric-box">
+          <div class="metric-label">담당자 절감 시간</div>
+          <div class="metric-value orange">월 {:.0f}h</div>
+          <div style="font-size:0.75rem;color:#888">건당 약 39분 절감</div>
+        </div>""".format(pass_count * 39 / 60), unsafe_allow_html=True)
+    with e4:
+        st.markdown("""
+        <div class="metric-box">
+          <div class="metric-label">오류 발생률</div>
+          <div class="metric-value green">↓ 94%</div>
+          <div style="font-size:0.75rem;color:#888">OCR 자동 입력</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── CSV 다운로드 ──────────────────────────────────────────
+    csv = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="📥 전체 출장 기록 CSV 다운로드",
+        data=csv,
+        file_name=f"출장기록_{datetime.date.today()}.csv",
+        mime="text/csv",
+    )
