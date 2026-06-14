@@ -227,11 +227,23 @@ def parse_receipts(text: str) -> dict:
         entry_m = re.search(r"입구영업소\s*[：:]\s*([^\n]+)", block)
         entry   = entry_m.group(1).strip() if entry_m else None
 
-        # 금액: "1 종  2,400원" 또는 "KEC 2,400원" 등
-        amt_m = re.search(r"(?:KEC|종)\s+([\d,]+)원", block)
+        # 금액 파싱 (여러 패턴 시도)
+        # 패턴1: "KEC 5,700원" 또는 "KEC5,700원"
+        amt_m = re.search(r"KEC\s*([\d,]+)\s*원", block)
+        # 패턴2: "1 종 5,700원(카드)" 또는 "1종 5,700원"
         if not amt_m:
-            amt_m = re.search(r"([\d,]+)원", block)
-        amount = int(amt_m.group(1).replace(",", "")) if amt_m else 0
+            amt_m = re.search(r"\d\s*종\s*([\d,]+)\s*원", block)
+        # 패턴3: 공급가액
+        if not amt_m:
+            amt_m = re.search(r"공급가액\s*:\s*([\d,]+)\s*원", block)
+        # 패턴4: 숫자+원 (최소 3자리 이상, 부가세/전화번호 제외)
+        if not amt_m:
+            candidates = re.findall(r"(\d{3,6})원", block)
+            # 부가세 0원 제외, TEL 번호 제외
+            valid = [c for c in candidates if int(c) > 0 and len(c) <= 6]
+            if valid:
+                amt_m = type("m", (), {"group": lambda self, n: valid[0]})()
+        amount = int(str(amt_m.group(1)).replace(",", "")) if amt_m else 0
 
         # 시각
         time_m = re.search(r"(\d{2})시(\d{2})분", block)
@@ -829,7 +841,7 @@ with tab3:
         else: return "background-color:#fff3e0;color:#e65100;font-weight:600"
 
     st.dataframe(
-        show_df.style.applymap(style_row, subset=["상태"]),
+        show_df.style.map(style_row, subset=["상태"]),
         use_container_width=True, height=300,
         column_config={
             "청구금액(원)": st.column_config.NumberColumn(format="%,d 원"),
