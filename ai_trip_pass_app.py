@@ -182,109 +182,164 @@ def get_opinet_fuel_price(fuel_type: str):
 # ══════════════════════════════════════════════
 # 영수증 분석 (pdfplumber 직접 파싱 — 완전 무료)
 # ══════════════════════════════════════════════
-def extract_pdf_text(file_bytes: bytes) -> str:
-    """pdfplumber로 PDF 전체 텍스트 추출"""
+def extract_pdf_receipts(file_bytes: bytes) -> list[str]:
+    """
+    pdfplumber로 PDF를 컬럼별로 분리해 각 영수증 텍스트 리스트를 반환합니다.
+    하이패스 영수증은 3단 컬럼 레이아웃이므로 x 좌표로 컬럼을 나눕니다.
+    """
     try:
         import pdfplumber
+        receipt_texts = []
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+            for page in pdf.pages:
+                words = page.extract_words()
+                if not words:
+                    continue
+                W = page.width
+                col_w = W / 3
+
+                # x 좌표 기준으로 3컬럼 분리
+                cols = {0: [], 1: [], 2: []}
+                for w in words:
+                    c = min(int(w['x0'] // col_w), 2)
+                    cols[c].append(w)
+
+                # 컬럼별 → y 순서로 텍스트 재조합
+                for c in [0, 1, 2]:
+                    lines = {}
+                    for w in cols[c]:
+                        y = round(w['top'] / 4) * 4  # 4px 단위 그룹핑
+                        lines.setdefault(y, []).append(w)
+                    col_text = "\n".join(
+                        " ".join(w['text'] for w in sorted(lines[y], key=lambda x: x['x0']))
+                        for y in sorted(lines)
+                    )
+                    # 영수증이 포함된 컬럼만 추가 (KEC 또는 영업소 포함 여부로 판단)
+                    if re.search(r"영업소|KEC|통행료|\d종\s*\d", col_text):
+                        # 컬럼 안에 여러 영수증이 있을 수 있으므로 블록 분리
+                        blocks = re.split(r"(?=하이패스는|영수증\n한국도로공사)", col_text)
+                        for block in blocks:
+                            if re.search(r"KEC|종\s*[\d,]+\s*원|영업소", block):
+                                receipt_texts.append(block.strip())
+        return receipt_texts
     except Exception:
-        return ""
+        return []
 
 
-def parse_receipts(text: str) -> dict:
+def parse_single_receipt(block: str) -> dict | None:
+    """단일 영수증 블록에서 정보를 파싱합니다."""
+    # 영업소명
+    name_m = re.search(r"한국도로공사\s+(\S+영업소)", block)
+    if not name_m:
+        name_m = re.search(r"(\S+영업소)", block)
+    office = name_m.group(1).strip() if name_m else ""
+
+    # 날짜·시각
+    dt_m = re.search(r"(\d{4})년(\d{2})월(\d{2})일\s*(\d{2})시(\d{2})분", block)
+    if dt_m:
+        y, mo, d, h, mi = dt_m.groups()
+        date_str = f"{y}.{mo}.{d}"
+        time_str = f"{h}:{mi}"
+        dt_obj   = datetime.datetime(int(y), int(mo), int(d), int(h), int(mi))
+    else:
+        date_str = datetime.date.today().strftime("%Y.%m.%d")
+        time_str = ""
+        dt_obj   = None
+
+    # 입구영업소
+    entry_m = re.search(r"입구영업소\s*:\s*(\S+)", block)
+    entry   = entry_m.group(1).strip() if entry_m else None
+
+    # 금액 (KEC 우선)
+    amt_m = re.search(r"KEC\s*([\d,]+)\s*원", block)
+    if not amt_m:
+        amt_m = re.search(r"\d\s*종\s*([\d,]+)\s*원", block)
+    if not amt_m:
+        amt_m = re.search(r"공급가액\s*:\s*([\d,]+)\s*원", block)
+    amount = int(amt_m.group(1).replace(",", "")) if amt_m else 0
+
+    if not office and amount == 0:
+        return None
+
+    return {
+        "영업소":    office,
+        "입구영업소": entry,
+        "금액":      amount,
+        "날짜":      date_str,
+        "시각":      time_str,
+        "datetime":  dt_obj,
+    }
+
+
+def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
     """
-    하이패스 PDF 영수증 파싱 (3단 컬럼 레이아웃 대응)
-
-    pdfplumber는 다단 레이아웃을 가로로 섞어서 읽으므로
-    블록 분리 대신 '전체 텍스트에서 항목별 리스트 추출' 방식 사용.
-    - 영업소명 목록, 날짜·시각 목록, KEC 금액 목록을 각각 추출
-    - 총액은 '총N건/NNNNN원' 텍스트로 최종 검증
+    하이패스 PDF 영수증 전체 파싱.
+    - file_bytes가 있으면 컬럼 분리 방식으로 정확하게 파싱
+    - text만 있으면 총액 텍스트 기반 파싱으로 폴백
     """
     cities = list(DISTANCE_FROM_SEOUL.keys())
-
-    # ── 날짜: 가장 이른 날짜 ─────────────────────
-    dates = re.findall(r"(\d{4})년(\d{2})월(\d{2})일", text)
-    if dates:
-        parsed_dates = [datetime.date(int(y), int(m), int(d)) for y, m, d in dates]
-        trip_date = min(parsed_dates).strftime("%Y.%m.%d")
-    else:
-        d = re.search(r"(\d{4})[.\-/](\d{2})[.\-/](\d{2})", text)
-        trip_date = d.group() if d else datetime.date.today().strftime("%Y.%m.%d")
-
-    # ── 영업소 목록 (순서대로) ───────────────────
-    offices = re.findall(r"한국도로공사\s+(\S+영업소)", text)
-
-    # ── 날짜·시각 목록 ───────────────────────────
-    datetimes = re.findall(r"\d{4}년\d{2}월\d{2}일\s*(\d{2})시(\d{2})분", text)
-    times = [f"{h}:{m}" for h, m in datetimes]
-
-    # ── 입구영업소 목록 ──────────────────────────
-    entries = re.findall(r"입구영업소\s*:\s*(\S+)", text)
-
-    # ── 금액 목록: KEC 금액 우선, 없으면 종 금액 ──
-    kec_amounts = re.findall(r"KEC\s*([\d,]+)\s*원", text)
-    if not kec_amounts:
-        kec_amounts = re.findall(r"\d\s*종\s*([\d,]+)\s*원", text)
-
-    amounts = [int(a.replace(",", "")) for a in kec_amounts]
-
-    # ── 영수증 상세 조합 ─────────────────────────
-    count = max(len(offices), len(amounts))
     receipts = []
-    for i in range(count):
-        receipts.append({
-            "영업소":    offices[i]  if i < len(offices)  else f"영업소{i+1}",
-            "금액":      amounts[i]  if i < len(amounts)  else 0,
-            "시각":      times[i]    if i < len(times)    else "",
-            "입구영업소": None,
-        })
 
-    # ── 입구영업소를 시각 기준으로 매핑 ──────────
-    # 입구영업소는 해당 블록의 영수증에 속함
-    # 시각순 정렬 후 입구영업소가 있는 항목에 매핑
-    receipts_by_time = sorted(receipts, key=lambda r: r["시각"] or "99:99")
-    entry_idx = 0
-    for r in receipts_by_time:
-        if entry_idx < len(entries):
-            r["입구영업소"] = entries[entry_idx]
-            entry_idx += 1
+    # ── 컬럼 분리 방식 (정확) ────────────────────
+    if file_bytes:
+        blocks = extract_pdf_receipts(file_bytes)
+        for block in blocks:
+            r = parse_single_receipt(block)
+            if r:
+                receipts.append(r)
 
-    # ── 통행료 합계: KEC 합산 후 총액 텍스트로 검증 ──
-    total_toll = sum(amounts)
+    # ── 폴백: 텍스트 전체 파싱 ──────────────────
+    if not receipts and text:
+        offices  = re.findall(r"한국도로공사\s+(\S+영업소)", text)
+        times_raw = re.findall(r"(\d{4})년(\d{2})월(\d{2})일\s*(\d{2})시(\d{2})분", text)
+        entries  = re.findall(r"입구영업소\s*:\s*(\S+)", text)
+        kec_amts = re.findall(r"KEC\s*([\d,]+)\s*원", text)
+        amounts  = [int(a.replace(",", "")) for a in kec_amts]
+        for i, office in enumerate(offices):
+            t = times_raw[i] if i < len(times_raw) else None
+            receipts.append({
+                "영업소":    office,
+                "입구영업소": entries[i] if i < len(entries) else None,
+                "금액":      amounts[i] if i < len(amounts) else 0,
+                "날짜":      f"{t[0]}.{t[1]}.{t[2]}" if t else "",
+                "시각":      f"{t[3]}:{t[4]}" if t else "",
+                "datetime":  datetime.datetime(int(t[0]),int(t[1]),int(t[2]),int(t[3]),int(t[4])) if t else None,
+            })
+
+    # ── 시간순 정렬 ──────────────────────────────
+    receipts.sort(key=lambda r: r["datetime"] or datetime.datetime.max)
+
+    # ── 통행료 합계 ──────────────────────────────
+    total_toll = sum(r["금액"] for r in receipts)
+    # 총액 텍스트로 검증
     total_m = re.search(r"총\s*\d+\s*건\s*/\s*([\d,]+)\s*원", text)
     if total_m:
         total_toll = int(total_m.group(1).replace(",", ""))
 
-    # ── 출발지: 가장 이른 시각의 입구영업소 ────────
-    earliest = receipts_by_time[0] if receipts_by_time else {}
-    origin_gate = earliest.get("입구영업소") or earliest.get("영업소") or "출발요금소"
+    # ── 출발 요금소: 가장 이른 시각 ────────────
+    first = receipts[0]  if receipts else {}
+    # 입구영업소가 있으면 입구영업소가 실제 출발지
+    origin_gate = first.get("입구영업소") or first.get("영업소") or "출발요금소"
 
-    # ── 목적지: 가장 늦은 시각의 입구영업소 ────────
-    latest = receipts_by_time[-1] if receipts_by_time else {}
-    # 마지막 입구영업소가 있으면 그게 최종 도착지
-    last_entry = None
-    for r in reversed(receipts_by_time):
-        if r.get("입구영업소"):
-            last_entry = r["입구영업소"]
-            break
-    dest_gate = last_entry or latest.get("영업소") or "도착요금소"
+    # ── 도착 요금소: 가장 늦은 시각 ────────────
+    last = receipts[-1] if receipts else {}
+    dest_gate = last.get("입구영업소") or last.get("영업소") or "도착요금소"
+
+    # 출장일: 가장 이른 날짜
+    trip_date = first.get("날짜") or datetime.date.today().strftime("%Y.%m.%d")
 
     # ── 도시 매핑 ────────────────────────────────
-    origin_city = gate_to_city(origin_gate)
-    dest_city   = gate_to_city(dest_gate)
+    def find_city(gate):
+        city = gate_to_city(gate)
+        if not city:
+            for c in cities:
+                if c in gate:
+                    city = c
+                    break
+        return city
 
-    # 직접 도시명 검색 (매핑 실패 시)
-    if not origin_city:
-        for city in cities:
-            if city in origin_gate:
-                origin_city = city
-                break
-    if not dest_city:
-        for city in cities:
-            if city in dest_gate:
-                dest_city = city
-                break
+    origin_city = find_city(origin_gate)
+    dest_city   = find_city(dest_gate)
 
     return {
         "trip_date":   trip_date,
@@ -294,8 +349,8 @@ def parse_receipts(text: str) -> dict:
         "dest_gate":   dest_gate,
         "origin_city": origin_city,
         "dest_city":   dest_city,
-        "ocr_text":    text[:500],
-        "method":      f"pdfplumber 직접 파싱 (무료) — {len(receipts)}건 인식",
+        "ocr_text":    f"영수증 {len(receipts)}건 인식 | 출발: {origin_gate}({first.get('시각','')}) → 도착: {dest_gate}({last.get('시각','')})",
+        "method":      f"pdfplumber 컬럼 분리 파싱 (무료) — {len(receipts)}건",
         "is_total":    True,
     }
 
@@ -472,14 +527,20 @@ with tab1:
             result = None
 
             if receipt_file.type == "application/pdf":
-                with st.spinner("📄 PDF 텍스트 추출 중..."):
-                    pdf_text = extract_pdf_text(file_bytes)
+                with st.spinner("📄 PDF 분석 중 (컬럼 분리 파싱)..."):
+                    pdf_text = ""
+                    try:
+                        import pdfplumber
+                        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                            pdf_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+                    except Exception:
+                        pass
+                    result = parse_receipts(text=pdf_text, file_bytes=file_bytes)
 
-                if pdf_text.strip():
-                    result = parse_receipts(pdf_text)
+                if result and result.get("toll_fee", 0) > 0:
                     st.success(f"✅ {result['method']} 완료")
                 else:
-                    st.error("❌ PDF에서 텍스트를 추출하지 못했습니다. 스캔된 이미지 PDF일 수 있습니다.")
+                    st.warning("⚠️ 일부 항목을 인식하지 못했습니다. 아래에서 직접 수정하세요.")
             else:
                 img = Image.open(io.BytesIO(file_bytes))
                 st.image(img, caption="업로드된 영수증", use_container_width=True)
@@ -562,9 +623,23 @@ with tab1:
         oi = cities.index(ocr_origin) if ocr_origin and ocr_origin in cities else cities.index("서울")
         di = cities.index(ocr_dest)   if ocr_dest   and ocr_dest   in cities else (cities.index("수원") if "수원" in cities else 1)
 
+        # selectbox 값을 session_state로 동기화
+        if "sel_origin_val" not in st.session_state or ocr_origin:
+            st.session_state["sel_origin_val"] = cities[oi]
+        if "sel_dest_val" not in st.session_state or ocr_dest:
+            st.session_state["sel_dest_val"] = cities[di]
+
         c1, c2 = st.columns(2)
-        with c1: origin      = st.selectbox("출발지", cities, index=oi, key="sel_origin")
-        with c2: destination = st.selectbox("목적지", cities, index=di, key="sel_dest")
+        with c1:
+            origin = st.selectbox("출발지", cities,
+                                  index=cities.index(st.session_state["sel_origin_val"]),
+                                  key="sel_origin")
+        with c2:
+            destination = st.selectbox("목적지", cities,
+                                       index=cities.index(st.session_state["sel_dest_val"]),
+                                       key="sel_dest")
+        st.session_state["sel_origin_val"] = origin
+        st.session_state["sel_dest_val"]   = destination
 
         st.session_state.destination = destination
         st.session_state.dest_coord  = DESTINATION_COORDS.get(destination, (37.5665,126.9780))
