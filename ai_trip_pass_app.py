@@ -194,107 +194,87 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 def parse_receipts(text: str) -> dict:
     """
-    하이패스 영수증 텍스트를 파싱합니다.
-    여러 건이 포함된 경우 통행료를 합산하고
-    첫 번째 입구영업소 = 출발지, 마지막 영업소 = 목적지로 판단합니다.
+    하이패스 PDF 영수증 파싱 (3단 컬럼 레이아웃 대응)
+
+    pdfplumber는 다단 레이아웃을 가로로 섞어서 읽으므로
+    블록 분리 대신 '전체 텍스트에서 항목별 리스트 추출' 방식 사용.
+    - 영업소명 목록, 날짜·시각 목록, KEC 금액 목록을 각각 추출
+    - 총액은 '총N건/NNNNN원' 텍스트로 최종 검증
     """
     cities = list(DISTANCE_FROM_SEOUL.keys())
 
-    # ── 날짜: 가장 이른 날짜 추출 ──────────────────
-    dates = re.findall(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일", text)
+    # ── 날짜: 가장 이른 날짜 ─────────────────────
+    dates = re.findall(r"(\d{4})년(\d{2})월(\d{2})일", text)
     if dates:
         parsed_dates = [datetime.date(int(y), int(m), int(d)) for y, m, d in dates]
-        earliest = min(parsed_dates)
-        trip_date = earliest.strftime("%Y.%m.%d")
+        trip_date = min(parsed_dates).strftime("%Y.%m.%d")
     else:
         d = re.search(r"(\d{4})[.\-/](\d{2})[.\-/](\d{2})", text)
         trip_date = d.group() if d else datetime.date.today().strftime("%Y.%m.%d")
 
-    # ── 영수증 블록 분리 (영업소 단위) ─────────────
-    # 한국도로공사 XXX영업소 패턴으로 블록 나누기
-    blocks = re.split(r"(?=한국도로공사)", text)
-    blocks = [b.strip() for b in blocks if b.strip()]
+    # ── 영업소 목록 (순서대로) ───────────────────
+    offices = re.findall(r"한국도로공사\s+(\S+영업소)", text)
 
+    # ── 날짜·시각 목록 ───────────────────────────
+    datetimes = re.findall(r"\d{4}년\d{2}월\d{2}일\s*(\d{2})시(\d{2})분", text)
+    times = [f"{h}:{m}" for h, m in datetimes]
+
+    # ── 입구영업소 목록 ──────────────────────────
+    entries = re.findall(r"입구영업소\s*:\s*(\S+)", text)
+
+    # ── 금액 목록: KEC 금액 우선, 없으면 종 금액 ──
+    kec_amounts = re.findall(r"KEC\s*([\d,]+)\s*원", text)
+    if not kec_amounts:
+        kec_amounts = re.findall(r"\d\s*종\s*([\d,]+)\s*원", text)
+
+    amounts = [int(a.replace(",", "")) for a in kec_amounts]
+
+    # ── 영수증 상세 조합 ─────────────────────────
+    count = max(len(offices), len(amounts))
     receipts = []
-    total_toll = 0
+    for i in range(count):
+        receipts.append({
+            "영업소":    offices[i]  if i < len(offices)  else f"영업소{i+1}",
+            "금액":      amounts[i]  if i < len(amounts)  else 0,
+            "시각":      times[i]    if i < len(times)    else "",
+            "입구영업소": None,
+        })
 
-    for block in blocks:
-        # 영업소명
-        name_m = re.search(r"한국도로공사\s+(.+?영업소)", block)
-        office  = name_m.group(1).strip() if name_m else ""
+    # ── 입구영업소를 시각 기준으로 매핑 ──────────
+    # 입구영업소는 해당 블록의 영수증에 속함
+    # 시각순 정렬 후 입구영업소가 있는 항목에 매핑
+    receipts_by_time = sorted(receipts, key=lambda r: r["시각"] or "99:99")
+    entry_idx = 0
+    for r in receipts_by_time:
+        if entry_idx < len(entries):
+            r["입구영업소"] = entries[entry_idx]
+            entry_idx += 1
 
-        # 입구영업소 (진입 출발지)
-        entry_m = re.search(r"입구영업소\s*[：:]\s*([^\n]+)", block)
-        entry   = entry_m.group(1).strip() if entry_m else None
-
-        # 금액 파싱 (여러 패턴 시도)
-        # 패턴1: "KEC 5,700원" 또는 "KEC5,700원"
-        amt_m = re.search(r"KEC\s*([\d,]+)\s*원", block)
-        # 패턴2: "1 종 5,700원(카드)" 또는 "1종 5,700원"
-        if not amt_m:
-            amt_m = re.search(r"\d\s*종\s*([\d,]+)\s*원", block)
-        # 패턴3: 공급가액
-        if not amt_m:
-            amt_m = re.search(r"공급가액\s*:\s*([\d,]+)\s*원", block)
-        # 패턴4: 숫자+원 (최소 3자리 이상, 부가세/전화번호 제외)
-        if not amt_m:
-            candidates = re.findall(r"(\d{3,6})원", block)
-            # 부가세 0원 제외, TEL 번호 제외
-            valid = [c for c in candidates if int(c) > 0 and len(c) <= 6]
-            if valid:
-                amt_m = type("m", (), {"group": lambda self, n: valid[0]})()
-        amount = int(str(amt_m.group(1)).replace(",", "")) if amt_m else 0
-
-        # 시각
-        time_m = re.search(r"(\d{2})시(\d{2})분", block)
-        time_str = f"{time_m.group(1)}:{time_m.group(2)}" if time_m else ""
-
-        if office or amount:
-            receipts.append({
-                "영업소": office,
-                "입구영업소": entry,
-                "금액": amount,
-                "시각": time_str,
-            })
-            total_toll += amount
-
-    # 총액 텍스트로 검증 ("총N건/15300원")
-    total_m = re.search(r"총\s*\d+건\s*/\s*([\d,]+)원", text)
+    # ── 통행료 합계: KEC 합산 후 총액 텍스트로 검증 ──
+    total_toll = sum(amounts)
+    total_m = re.search(r"총\s*\d+\s*건\s*/\s*([\d,]+)\s*원", text)
     if total_m:
         total_toll = int(total_m.group(1).replace(",", ""))
 
-    # ── 시간순 정렬 (빠른 시각이 출발) ────────────
-    def sort_key(r):
-        t = r.get("시각","99:99")
-        return t if t else "99:99"
-    receipts_sorted = sorted(receipts, key=sort_key)
-
     # ── 출발지: 가장 이른 시각의 입구영업소 ────────
-    origin_gate = None
-    for r in receipts_sorted:
-        if r.get("입구영업소"):
-            origin_gate = r["입구영업소"]
-            break
-    if not origin_gate and receipts_sorted:
-        origin_gate = receipts_sorted[0]["영업소"]
-    origin_gate = origin_gate or "출발요금소"
+    earliest = receipts_by_time[0] if receipts_by_time else {}
+    origin_gate = earliest.get("입구영업소") or earliest.get("영업소") or "출발요금소"
 
-    # ── 목적지: 가장 늦은 시각의 입구영업소 또는 영업소 ──
-    dest_gate = None
-    for r in reversed(receipts_sorted):
+    # ── 목적지: 가장 늦은 시각의 입구영업소 ────────
+    latest = receipts_by_time[-1] if receipts_by_time else {}
+    # 마지막 입구영업소가 있으면 그게 최종 도착지
+    last_entry = None
+    for r in reversed(receipts_by_time):
         if r.get("입구영업소"):
-            dest_gate = r["입구영업소"]
+            last_entry = r["입구영업소"]
             break
-    if not dest_gate and receipts_sorted:
-        # 입구영업소 없는 경우 중간 영업소(실제 경유지) 중 마지막
-        dest_gate = receipts_sorted[-1]["영업소"]
-    dest_gate = dest_gate or "도착요금소"
+    dest_gate = last_entry or latest.get("영업소") or "도착요금소"
 
-    # ── 도시 매핑 ───────────────────────────────────
+    # ── 도시 매핑 ────────────────────────────────
     origin_city = gate_to_city(origin_gate)
     dest_city   = gate_to_city(dest_gate)
 
-    # 도시 못 찾으면 텍스트에서 도시명 직접 검색
+    # 직접 도시명 검색 (매핑 실패 시)
     if not origin_city:
         for city in cities:
             if city in origin_gate:
@@ -315,9 +295,10 @@ def parse_receipts(text: str) -> dict:
         "origin_city": origin_city,
         "dest_city":   dest_city,
         "ocr_text":    text[:500],
-        "method":      "pdfplumber 직접 파싱 (무료)",
+        "method":      f"pdfplumber 직접 파싱 (무료) — {len(receipts)}건 인식",
         "is_total":    True,
     }
+
 
 
 # ══════════════════════════════════════════════
