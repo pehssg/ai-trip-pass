@@ -180,9 +180,10 @@ def get_opinet_fuel_price(fuel_type: str):
 
 
 # ══════════════════════════════════════════════
-# 영수증 분석
+# 영수증 분석 (pdfplumber 직접 파싱 — 완전 무료)
 # ══════════════════════════════════════════════
 def extract_pdf_text(file_bytes: bytes) -> str:
+    """pdfplumber로 PDF 전체 텍스트 추출"""
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
@@ -191,112 +192,120 @@ def extract_pdf_text(file_bytes: bytes) -> str:
         return ""
 
 
-def analyze_receipts_with_claude(text: str) -> dict:
-    """Claude API로 영수증 텍스트(여러 건) 분석 → 합계 반환"""
-    try:
-        city_list = ", ".join(DISTANCE_FROM_SEOUL.keys())
-        prompt = f"""아래는 하이패스 영수증 텍스트입니다. 여러 건이 포함될 수 있습니다.
-다음 규칙으로 JSON만 반환하세요. 다른 말은 하지 마세요.
+def parse_receipts(text: str) -> dict:
+    """
+    하이패스 영수증 텍스트를 파싱합니다.
+    여러 건이 포함된 경우 통행료를 합산하고
+    첫 번째 입구영업소 = 출발지, 마지막 영업소 = 목적지로 판단합니다.
+    """
+    cities = list(DISTANCE_FROM_SEOUL.keys())
 
-1. trip_date: 가장 이른 결제 날짜 (YYYY.MM.DD)
-2. total_toll: 모든 통행료 합계 정수 (원 단위)
-3. receipts: [{{"영업소": "이름", "금액": 숫자, "시각": "HH:MM"}}]
-4. origin_gate: 첫 번째 영수증의 입구영업소 값. 없으면 첫 영업소명
-5. dest_gate: 마지막 영수증의 영업소명
-6. origin_city: 출발 도시 ({city_list} 중 하나, 모르면 null)
-7. dest_city: 목적지 도시 ({city_list} 중 하나, 모르면 null)
+    # ── 날짜: 가장 이른 날짜 추출 ──────────────────
+    dates = re.findall(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일", text)
+    if dates:
+        parsed_dates = [datetime.date(int(y), int(m), int(d)) for y, m, d in dates]
+        earliest = min(parsed_dates)
+        trip_date = earliest.strftime("%Y.%m.%d")
+    else:
+        d = re.search(r"(\d{4})[.\-/](\d{2})[.\-/](\d{2})", text)
+        trip_date = d.group() if d else datetime.date.today().strftime("%Y.%m.%d")
 
-영수증 텍스트:
-{text[:3000]}"""
+    # ── 영수증 블록 분리 (영업소 단위) ─────────────
+    # 한국도로공사 XXX영업소 패턴으로 블록 나누기
+    blocks = re.split(r"(?=한국도로공사)", text)
+    blocks = [b.strip() for b in blocks if b.strip()]
 
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type":"application/json"},
-            json={
-                "model":"claude-sonnet-4-20250514",
-                "max_tokens":800,
-                "messages":[{"role":"user","content":prompt}],
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["content"][0]["text"].strip()
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not m:
-            raise ValueError("JSON 없음")
-        data = json.loads(m.group())
+    receipts = []
+    total_toll = 0
 
-        trip_date  = re.sub(r"[-/]",".", str(data.get("trip_date") or datetime.date.today().strftime("%Y.%m.%d")))
-        total_toll = int(str(data.get("total_toll",0)).replace(",",""))
-        origin_gate = str(data.get("origin_gate") or "출발요금소")
-        dest_gate   = str(data.get("dest_gate")   or "도착요금소")
+    for block in blocks:
+        # 영업소명
+        name_m = re.search(r"한국도로공사\s+(.+?영업소)", block)
+        office  = name_m.group(1).strip() if name_m else ""
 
-        cities = list(DISTANCE_FROM_SEOUL.keys())
-        origin_city = data.get("origin_city") if data.get("origin_city") in cities else gate_to_city(origin_gate)
-        dest_city   = data.get("dest_city")   if data.get("dest_city")   in cities else gate_to_city(dest_gate)
+        # 입구영업소 (진입 출발지)
+        entry_m = re.search(r"입구영업소\s*[：:]\s*([^\n]+)", block)
+        entry   = entry_m.group(1).strip() if entry_m else None
 
-        return {
-            "trip_date":   trip_date,
-            "toll_fee":    total_toll,
-            "toll_detail": data.get("receipts", []),
-            "origin_gate": origin_gate,
-            "dest_gate":   dest_gate,
-            "origin_city": origin_city,
-            "dest_city":   dest_city,
-            "ocr_text":    raw[:400],
-            "method":      "Claude AI (텍스트 분석)",
-            "is_total":    True,
-        }
-    except Exception:
-        return None
+        # 금액: "1 종  2,400원" 또는 "KEC 2,400원" 등
+        amt_m = re.search(r"(?:KEC|종)\s+([\d,]+)원", block)
+        if not amt_m:
+            amt_m = re.search(r"([\d,]+)원", block)
+        amount = int(amt_m.group(1).replace(",", "")) if amt_m else 0
 
+        # 시각
+        time_m = re.search(r"(\d{2})시(\d{2})분", block)
+        time_str = f"{time_m.group(1)}:{time_m.group(2)}" if time_m else ""
 
-def analyze_receipt_with_vision(image: Image.Image) -> dict:
-    """이미지 영수증 → Claude Vision 분석"""
-    try:
-        buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=90)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        city_list = ", ".join(DISTANCE_FROM_SEOUL.keys())
-        prompt = f"""이 이미지는 하이패스 영수증입니다. 여러 건 포함 가능.
-JSON만 반환하세요:
-{{"trip_date":"YYYY.MM.DD","total_toll":합계정수,"receipts":[{{"영업소":"이름","금액":숫자}}],
-"origin_gate":"첫입구영업소","dest_gate":"마지막영업소",
-"origin_city":"도시({city_list} 중 하나 또는 null)","dest_city":"도시 또는 null"}}"""
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"Content-Type":"application/json"},
-            json={
-                "model":"claude-sonnet-4-20250514","max_tokens":600,
-                "messages":[{"role":"user","content":[
-                    {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":b64}},
-                    {"type":"text","text":prompt},
-                ]}],
-            },
-            timeout=20,
-        )
-        resp.raise_for_status()
-        raw = resp.json()["content"][0]["text"].strip()
-        mm = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not mm:
-            raise ValueError("JSON 없음")
-        data = json.loads(mm.group())
+        if office or amount:
+            receipts.append({
+                "영업소": office,
+                "입구영업소": entry,
+                "금액": amount,
+                "시각": time_str,
+            })
+            total_toll += amount
 
-        trip_date  = re.sub(r"[-/]",".", str(data.get("trip_date") or datetime.date.today().strftime("%Y.%m.%d")))
-        total_toll = int(str(data.get("total_toll",0)).replace(",",""))
-        cities = list(DISTANCE_FROM_SEOUL.keys())
-        og = str(data.get("origin_gate") or "출발요금소")
-        dg = str(data.get("dest_gate")   or "도착요금소")
-        oc = data.get("origin_city") if data.get("origin_city") in cities else gate_to_city(og)
-        dc = data.get("dest_city")   if data.get("dest_city")   in cities else gate_to_city(dg)
-        return {
-            "trip_date":og,"toll_fee":total_toll,"toll_detail":data.get("receipts",[]),
-            "origin_gate":og,"dest_gate":dg,"origin_city":oc,"dest_city":dc,
-            "ocr_text":raw[:400],"method":"Claude Vision AI","is_total":True,
-            "trip_date":trip_date,
-        }
-    except Exception:
-        return None
+    # 총액 텍스트로 검증 ("총N건/15300원")
+    total_m = re.search(r"총\s*\d+건\s*/\s*([\d,]+)원", text)
+    if total_m:
+        total_toll = int(total_m.group(1).replace(",", ""))
+
+    # ── 시간순 정렬 (빠른 시각이 출발) ────────────
+    def sort_key(r):
+        t = r.get("시각","99:99")
+        return t if t else "99:99"
+    receipts_sorted = sorted(receipts, key=sort_key)
+
+    # ── 출발지: 가장 이른 시각의 입구영업소 ────────
+    origin_gate = None
+    for r in receipts_sorted:
+        if r.get("입구영업소"):
+            origin_gate = r["입구영업소"]
+            break
+    if not origin_gate and receipts_sorted:
+        origin_gate = receipts_sorted[0]["영업소"]
+    origin_gate = origin_gate or "출발요금소"
+
+    # ── 목적지: 가장 늦은 시각의 입구영업소 또는 영업소 ──
+    dest_gate = None
+    for r in reversed(receipts_sorted):
+        if r.get("입구영업소"):
+            dest_gate = r["입구영업소"]
+            break
+    if not dest_gate and receipts_sorted:
+        # 입구영업소 없는 경우 중간 영업소(실제 경유지) 중 마지막
+        dest_gate = receipts_sorted[-1]["영업소"]
+    dest_gate = dest_gate or "도착요금소"
+
+    # ── 도시 매핑 ───────────────────────────────────
+    origin_city = gate_to_city(origin_gate)
+    dest_city   = gate_to_city(dest_gate)
+
+    # 도시 못 찾으면 텍스트에서 도시명 직접 검색
+    if not origin_city:
+        for city in cities:
+            if city in origin_gate:
+                origin_city = city
+                break
+    if not dest_city:
+        for city in cities:
+            if city in dest_gate:
+                dest_city = city
+                break
+
+    return {
+        "trip_date":   trip_date,
+        "toll_fee":    total_toll,
+        "toll_detail": receipts,
+        "origin_gate": origin_gate,
+        "dest_gate":   dest_gate,
+        "origin_city": origin_city,
+        "dest_city":   dest_city,
+        "ocr_text":    text[:500],
+        "method":      "pdfplumber 직접 파싱 (무료)",
+        "is_total":    True,
+    }
 
 
 # ══════════════════════════════════════════════
@@ -470,44 +479,41 @@ with tab1:
             result = None
 
             if receipt_file.type == "application/pdf":
-                st.info("📄 PDF 감지 — 텍스트 추출 후 AI 분석 중...")
-                with st.spinner("분석 중..."):
+                with st.spinner("📄 PDF 텍스트 추출 중..."):
                     pdf_text = extract_pdf_text(file_bytes)
-                    if pdf_text.strip():
-                        result = analyze_receipts_with_claude(pdf_text)
-                if not result:
-                    try:
-                        from pdf2image import convert_from_bytes
-                        pages = convert_from_bytes(file_bytes, dpi=150)
-                        with st.spinner("이미지 변환 후 Vision AI 분석 중..."):
-                            result = analyze_receipt_with_vision(pages[0])
-                    except Exception:
-                        pass
+
+                if pdf_text.strip():
+                    result = parse_receipts(pdf_text)
+                    st.success(f"✅ {result['method']} 완료")
+                else:
+                    st.error("❌ PDF에서 텍스트를 추출하지 못했습니다. 스캔된 이미지 PDF일 수 있습니다.")
             else:
                 img = Image.open(io.BytesIO(file_bytes))
                 st.image(img, caption="업로드된 영수증", use_container_width=True)
-                with st.spinner("Vision AI 분석 중..."):
-                    result = analyze_receipt_with_vision(img)
+                st.warning("⚠️ 이미지 파일은 PDF로 변환 후 업로드하시면 더 정확하게 인식됩니다.")
+                # 이미지도 pdfplumber로 처리 불가 → 간단 정규식 파싱 시도
+                try:
+                    import pytesseract
+                    text = pytesseract.image_to_string(img, lang="kor+eng")
+                    result = parse_receipts(text)
+                    result["method"] = "pytesseract (이미지)"
+                    st.info(f"ℹ️ pytesseract로 인식")
+                except Exception:
+                    st.info("💡 PDF 파일로 업로드하면 자동 인식됩니다.")
 
             if not result:
                 result = {
                     "trip_date":   datetime.date.today().strftime("%Y.%m.%d"),
-                    "toll_fee":    15300,
+                    "toll_fee":    0,
                     "toll_detail": [],
-                    "origin_gate": "서서울(음성진입)",
-                    "dest_gate":   "금왕꽃동네",
-                    "origin_city": "서울",
-                    "dest_city":   "인천",
-                    "ocr_text":    "(AI 연결 실패 — 더미 데이터)",
-                    "method":      "Demo",
+                    "origin_gate": "출발요금소",
+                    "dest_gate":   "도착요금소",
+                    "origin_city": None,
+                    "dest_city":   None,
+                    "ocr_text":    "",
+                    "method":      "수동 입력 필요",
                     "is_total":    True,
                 }
-
-            method = result.get("method","")
-            if "Demo" in method:
-                st.warning("⚠️ AI 연결 실패 — 더미 데이터")
-            else:
-                st.success(f"✅ {method} 완료")
 
             c1, c2 = st.columns(2)
             with c1:
