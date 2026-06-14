@@ -369,6 +369,8 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
     origin_city = find_city(origin_gate)
     dest_city   = find_city(dest_gate)
 
+    last = receipts[-1] if receipts else {}
+
     return {
         "trip_date":   trip_date,
         "toll_fee":    total_toll,
