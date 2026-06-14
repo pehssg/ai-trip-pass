@@ -316,27 +316,55 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
     if total_m:
         total_toll = int(total_m.group(1).replace(",", ""))
 
-    # ── 출발 요금소: 가장 이른 시각 ────────────
-    first = receipts[0]  if receipts else {}
-    # 입구영업소가 있으면 입구영업소가 실제 출발지
+    # ── 출장일: 가장 이른 날짜 ─────────────────
+    first = receipts[0] if receipts else {}
+    trip_date = first.get("날짜") or datetime.date.today().strftime("%Y.%m.%d")
+
+    # ── 출발 요금소: 가장 이른 시각의 입구영업소 ─
+    # 입구영업소 = 그 톨게이트에 진입한 출발지
     origin_gate = first.get("입구영업소") or first.get("영업소") or "출발요금소"
 
-    # ── 도착 요금소: 가장 늦은 시각 ────────────
-    last = receipts[-1] if receipts else {}
-    dest_gate = last.get("입구영업소") or last.get("영업소") or "도착요금소"
+    # ── 목적지 판단 로직 ──────────────────────────
+    # 입구영업소가 있는 영수증 = 고속도로 진입점 (출발지 정보 포함)
+    # 입구영업소가 없는 영수증 = 일반 통과 요금소 (경유지/목적지)
+    # 목적지 = 입구영업소 없는 영수증 중 가장 많이 등장하는 영업소
+    middle_receipts = [r for r in receipts if not r.get("입구영업소")]
 
-    # 출장일: 가장 이른 날짜
-    trip_date = first.get("날짜") or datetime.date.today().strftime("%Y.%m.%d")
+    if middle_receipts:
+        # 목적지 판단: 전체 이동 시간의 중간점에 가장 가까운 영수증 영업소
+        # (왕복 출장에서 중간점 = 실제 목적지에서 머문 시간대)
+        has_dt = [r for r in middle_receipts if r.get("datetime")]
+        if has_dt and first.get("datetime") and receipts[-1].get("datetime"):
+            start_dt = first["datetime"]
+            end_dt   = receipts[-1]["datetime"]
+            mid_dt   = start_dt + (end_dt - start_dt) / 2
+            closest  = min(has_dt,
+                           key=lambda r: abs((r["datetime"] - mid_dt).total_seconds()))
+            dest_gate = closest.get("영업소") or "도착요금소"
+        else:
+            # datetime 없으면 빈도 기준
+            from collections import Counter
+            names = [r["영업소"].replace("영업소","").strip() for r in middle_receipts]
+            dest_gate = Counter(names).most_common(1)[0][0] + "영업소"
+    else:
+        dest_gate = receipts[-1].get("영업소") or "도착요금소"
 
     # ── 도시 매핑 ────────────────────────────────
     def find_city(gate):
+        # 1. 전체 이름으로 매핑
         city = gate_to_city(gate)
-        if not city:
-            for c in cities:
-                if c in gate:
-                    city = c
-                    break
-        return city
+        if city:
+            return city
+        # 2. 영업소명 내 도시명 직접 검색
+        gate_clean = gate.replace("영업소","").replace("한국도로공사","").strip()
+        city = gate_to_city(gate_clean)
+        if city:
+            return city
+        # 3. DISTANCE_FROM_SEOUL 키로 직접 매핑
+        for c in cities:
+            if c in gate:
+                return c
+        return None
 
     origin_city = find_city(origin_gate)
     dest_city   = find_city(dest_gate)
@@ -618,30 +646,22 @@ with tab1:
         st.markdown('<div class="card"><div class="card-title">② 출발지 · 목적지 설정</div>', unsafe_allow_html=True)
         cities = list(DISTANCE_FROM_SEOUL.keys())
 
-        # selectbox key 초기값 (최초 1회)
-        if "sel_origin" not in st.session_state:
-            st.session_state["sel_origin"] = "서울"
-        if "sel_dest" not in st.session_state:
-            st.session_state["sel_dest"] = "수원"
+        # OCR 인식값 읽기
+        ocr_origin = st.session_state.get("ocr_origin_city")
+        ocr_dest   = st.session_state.get("ocr_dest_city")
 
-        if st.session_state.get("ocr_origin_city") or st.session_state.get("ocr_dest_city"):
-            st.caption("✅ 영수증에서 자동 인식된 값이 반영되었습니다. 필요 시 수정하세요.")
+        if ocr_origin or ocr_dest:
+            st.caption("✅ 영수증에서 자동 인식 — 필요 시 수정 가능합니다.")
+
+        # index 직접 계산 (key 방식 사용 안 함 → Streamlit rerun 없이도 반영)
+        origin_default = cities.index(ocr_origin) if ocr_origin and ocr_origin in cities else 0
+        dest_default   = cities.index(ocr_dest)   if ocr_dest   and ocr_dest   in cities else 1
 
         c1, c2 = st.columns(2)
         with c1:
-            origin = st.selectbox(
-                "출발지", cities,
-                index=cities.index(st.session_state["sel_origin"])
-                      if st.session_state["sel_origin"] in cities else 0,
-                key="sel_origin",
-            )
+            origin = st.selectbox("출발지", cities, index=origin_default)
         with c2:
-            destination = st.selectbox(
-                "목적지", cities,
-                index=cities.index(st.session_state["sel_dest"])
-                      if st.session_state["sel_dest"] in cities else 1,
-                key="sel_dest",
-            )
+            destination = st.selectbox("목적지", cities, index=dest_default)
 
         st.session_state.destination = destination
         st.session_state.dest_coord  = DESTINATION_COORDS.get(destination, (37.5665,126.9780))
