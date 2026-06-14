@@ -601,45 +601,47 @@ with tab1:
                 with st.expander("📝 AI 분석 원문"):
                     st.text(result["ocr_text"])
 
-            # 세션 저장
+            # ── 세션 저장: selectbox key에 직접 반영 ──
             st.session_state.toll_fee  = result["toll_fee"] if result.get("is_total") else result["toll_fee"] * 2
             st.session_state.trip_date = result["trip_date"]
-            if result.get("origin_city"):
-                st.session_state.ocr_origin_city = result["origin_city"]
-            if result.get("dest_city"):
-                st.session_state.ocr_dest_city = result["dest_city"]
+            cities_tmp = list(DISTANCE_FROM_SEOUL.keys())
+            if result.get("origin_city") and result["origin_city"] in cities_tmp:
+                st.session_state["sel_origin"] = result["origin_city"]
+                st.session_state["ocr_origin_city"] = result["origin_city"]
+            if result.get("dest_city") and result["dest_city"] in cities_tmp:
+                st.session_state["sel_dest"] = result["dest_city"]
+                st.session_state["ocr_dest_city"] = result["dest_city"]
 
         st.markdown('</div>', unsafe_allow_html=True)
 
         # ② 출발지·목적지
         st.markdown('<div class="card"><div class="card-title">② 출발지 · 목적지 설정</div>', unsafe_allow_html=True)
         cities = list(DISTANCE_FROM_SEOUL.keys())
-        ocr_origin = st.session_state.get("ocr_origin_city")
-        ocr_dest   = st.session_state.get("ocr_dest_city")
 
-        if ocr_origin or ocr_dest:
+        # selectbox key 초기값 (최초 1회)
+        if "sel_origin" not in st.session_state:
+            st.session_state["sel_origin"] = "서울"
+        if "sel_dest" not in st.session_state:
+            st.session_state["sel_dest"] = "수원"
+
+        if st.session_state.get("ocr_origin_city") or st.session_state.get("ocr_dest_city"):
             st.caption("✅ 영수증에서 자동 인식된 값이 반영되었습니다. 필요 시 수정하세요.")
-
-        oi = cities.index(ocr_origin) if ocr_origin and ocr_origin in cities else cities.index("서울")
-        di = cities.index(ocr_dest)   if ocr_dest   and ocr_dest   in cities else (cities.index("수원") if "수원" in cities else 1)
-
-        # selectbox 값을 session_state로 동기화
-        if "sel_origin_val" not in st.session_state or ocr_origin:
-            st.session_state["sel_origin_val"] = cities[oi]
-        if "sel_dest_val" not in st.session_state or ocr_dest:
-            st.session_state["sel_dest_val"] = cities[di]
 
         c1, c2 = st.columns(2)
         with c1:
-            origin = st.selectbox("출발지", cities,
-                                  index=cities.index(st.session_state["sel_origin_val"]),
-                                  key="sel_origin")
+            origin = st.selectbox(
+                "출발지", cities,
+                index=cities.index(st.session_state["sel_origin"])
+                      if st.session_state["sel_origin"] in cities else 0,
+                key="sel_origin",
+            )
         with c2:
-            destination = st.selectbox("목적지", cities,
-                                       index=cities.index(st.session_state["sel_dest_val"]),
-                                       key="sel_dest")
-        st.session_state["sel_origin_val"] = origin
-        st.session_state["sel_dest_val"]   = destination
+            destination = st.selectbox(
+                "목적지", cities,
+                index=cities.index(st.session_state["sel_dest"])
+                      if st.session_state["sel_dest"] in cities else 1,
+                key="sel_dest",
+            )
 
         st.session_state.destination = destination
         st.session_state.dest_coord  = DESTINATION_COORDS.get(destination, (37.5665,126.9780))
