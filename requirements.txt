@@ -9,4 +9,3 @@ streamlit-folium>=0.20.0
 reportlab>=4.0.0
 pypdf>=4.0.0
 pdfplumber>=0.10.0
-pdf2image>=1.16.0
