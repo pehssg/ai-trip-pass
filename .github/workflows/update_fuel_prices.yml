@@ -2,7 +2,7 @@ name: 오피넷 유가 자동 업데이트
 
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 0 * * *"   # 매일 오전 9시 KST
   workflow_dispatch:
 
 env:
@@ -19,7 +19,6 @@ jobs:
       - name: 저장소 체크아웃
         uses: actions/checkout@v4
         with:
-          ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Python 설치
@@ -31,12 +30,14 @@ jobs:
         run: pip install requests beautifulsoup4
 
       - name: 오피넷 유가 스크래핑
+        env:
+          OPINET_API_KEY: ${{ secrets.OPINET_API_KEY }}
         run: python scripts/scrape_fuel_prices.py
 
       - name: 변경사항 커밋 & 푸시
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🛢️ 유가 자동 업데이트: ${{ github.run_id }}"
+          commit_message: "🛢️ 유가 자동 업데이트: $(date +'%Y-%m-%d')"
           file_pattern: fuel_prices.json
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
