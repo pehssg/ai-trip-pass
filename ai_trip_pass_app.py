@@ -1120,27 +1120,36 @@ with tab2:
     with col_result:
         if photo_file and gps_data:
             dist_km = haversine(dest_coord[0], dest_coord[1], gps_data["lat"], gps_data["lon"])
+            radius  = get_verify_radius(dest_name)
+
             st.markdown("#### 📏 위치 검증 결과")
             m1, m2 = st.columns(2)
             with m1: st.metric("목적지 좌표", f"{dest_coord[0]:.3f}, {dest_coord[1]:.3f}")
             with m2: st.metric("사진 좌표",   f"{gps_data['lat']:.3f}, {gps_data['lon']:.3f}")
-            st.metric("두 지점 간 거리", f"{dist_km:.2f} km", delta="기준: 5km 이내")
-            if dist_km <= 5.0:
-                st.success(f"✅ 정상 증빙 — {dest_name}에서 {dist_km:.2f}km 이내")
+            st.metric("두 지점 간 거리", f"{dist_km:.2f} km",
+                      delta=f"허용 반경: {radius:.0f}km ({dest_name} 기준)")
+            if dist_km <= radius:
+                st.success(
+                    f"✅ 정상 증빙 — {dest_name} 내 {dist_km:.2f}km 지점 "
+                    f"(허용 반경 {radius:.0f}km 이내)"
+                )
             else:
-                st.warning(f"⚠️ 위치 불일치 — {dist_km:.2f}km 떨어져 있음, 수기 확인 필요")
+                st.warning(
+                    f"⚠️ 위치 불일치 — {dest_name} 중심에서 {dist_km:.2f}km "
+                    f"(허용 반경 {radius:.0f}km 초과) · 수기 확인 필요"
+                )
 
     if photo_file and gps_data:
         st.markdown("#### 🗺️ 위치 시각화 지도")
         clat = (dest_coord[0] + gps_data["lat"]) / 2
         clon = (dest_coord[1] + gps_data["lon"]) / 2
         m = folium.Map(location=[clat,clon], zoom_start=11, tiles="CartoDB positron")
-        folium.Circle(location=dest_coord, radius=5000,
-                      color="#1a73e8", fill=True, fill_opacity=0.12,
-                      popup=f"목적지: {dest_name} (반경 5km)").add_to(m)
+        folium.Circle(location=dest_coord, radius=int(radius*1000),
+                      color="#1a73e8", fill=True, fill_opacity=0.10,
+                      popup=f"목적지: {dest_name} (허용 반경 {radius:.0f}km)").add_to(m)
         folium.Marker(dest_coord, popup=f"🏢 {dest_name}",
                       icon=folium.Icon(color="blue", icon="building", prefix="fa")).add_to(m)
-        pc = "green" if dist_km <= 5.0 else "orange"
+        pc = "green" if dist_km <= radius else "orange"
         folium.Marker([gps_data["lat"], gps_data["lon"]],
                       popup=f"📍 촬영 위치",
                       icon=folium.Icon(color=pc, icon="camera", prefix="fa")).add_to(m)
