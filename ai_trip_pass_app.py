@@ -414,38 +414,33 @@ def estimate_distance(origin: str, destination: str) -> float:
 
 
 def get_opinet_fuel_price(fuel_type: str):
-    code_map = {"휘발유":"B027","경유":"D047","LPG":"K015"}
-    prod_cd = code_map.get(fuel_type, "B027")
-    headers = {"User-Agent":"Mozilla/5.0","Accept-Language":"ko-KR,ko;q=0.9"}
-
-    # XML API
+    """
+    GitHub Actions가 매일 업데이트하는 fuel_prices.json을 읽어 유가를 반환합니다.
+    파일이 없거나 오래된 경우 예비 데이터를 사용합니다.
+    """
+    # ── fuel_prices.json 읽기 ─────────────────────
+    json_path = os.path.join(os.path.dirname(__file__), "fuel_prices.json")
     try:
-        r = requests.get(f"https://www.opinet.co.kr/api/avgAllPrice.do?out=xml&prodcd={prod_cd}",
-                         headers=headers, timeout=6)
-        if r.status_code == 200:
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(r.content)
-            el = root.find(".//PRICE")
-            if el is not None and el.text:
-                return int(float(el.text)), "오피넷 API"
-    except Exception:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        price = data.get(fuel_type)
+        updated = data.get("updated", "")
+        source  = data.get("source", "fuel_prices.json")
+
+        if price and isinstance(price, (int, float)) and 400 < price < 4000:
+            # 업데이트 날짜 표시
+            today = datetime.date.today().strftime("%Y-%m-%d")
+            freshness = "오늘" if updated == today else f"{updated} 기준"
+            return int(price), f"오피넷 ({freshness}, {source})"
+
+    except FileNotFoundError:
+        pass
+    except Exception as e:
         pass
 
-    # 스크래핑
-    try:
-        r = requests.get("https://www.opinet.co.kr/user/main/mainView.do",
-                         headers=headers, timeout=8)
-        soup = BeautifulSoup(r.text, "html.parser")
-        kw = {"휘발유":"휘발유","경유":"경유","LPG":"LPG"}.get(fuel_type,"휘발유")
-        m = re.search(rf"{kw}[^\d]{{0,20}}(\d{{1,2}},?\d{{3}}(?:\.\d+)?)", soup.get_text())
-        if m:
-            v = int(float(m.group(1).replace(",","")))
-            if 500 < v < 4000:
-                return v, "오피넷 스크래핑"
-    except Exception:
-        pass
-
-    return FALLBACK_FUEL_PRICES[fuel_type], "예비 데이터"
+    # ── 폴백: 예비 데이터 ─────────────────────────
+    return FALLBACK_FUEL_PRICES[fuel_type], "예비 데이터 (fuel_prices.json 없음)"
 
 
 # ══════════════════════════════════════════════
@@ -957,21 +952,34 @@ with tab1:
         st.session_state.fuel_type  = fuel_type
         st.session_state.car_model  = car_model
 
+        # 자동으로 fuel_prices.json에서 현재 유가 로드
+        _auto_price, _auto_source = get_opinet_fuel_price(fuel_type)
+        if st.session_state.fuel_price == 1650:   # 초기값이면 자동 반영
+            st.session_state.fuel_price  = _auto_price
+            st.session_state.fuel_source = _auto_source
+
         cb1, cb2 = st.columns([1,2])
         with cb1:
-            if st.button("🔄 오피넷 유가 조회", use_container_width=True):
-                with st.spinner("조회 중..."):
-                    price, source = get_opinet_fuel_price(fuel_type)
+            if st.button("🔄 유가 새로고침", use_container_width=True):
+                price, source = get_opinet_fuel_price(fuel_type)
                 st.session_state.fuel_price  = price
                 st.session_state.fuel_source = source
                 if "예비" in source:
-                    st.warning(f"⚠️ 예비 데이터: {price:,}원/L")
+                    st.warning(f"⚠️ {source}: {price:,}원/L")
                 else:
                     st.success(f"✅ {source}: {price:,}원/L")
         with cb2:
             manual = st.number_input("유가 직접 입력 (원/L)", min_value=500, max_value=3000,
                                      value=int(st.session_state.fuel_price), step=10)
             st.session_state.fuel_price = manual
+
+        # 현재 유가 출처 표시
+        _src = st.session_state.get("fuel_source", "")
+        if _src:
+            if "예비" in _src:
+                st.caption(f"⚠️ {_src} — GitHub Actions 설정 후 자동 업데이트됩니다")
+            else:
+                st.caption(f"✅ {_src}")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
