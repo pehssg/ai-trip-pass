@@ -1139,6 +1139,12 @@ with tab2:
                     f"(허용 반경 {radius:.0f}km 초과) · 수기 확인 필요"
                 )
 
+    # 지도 섹션에서 radius/dist_km 사용 — 기본값 먼저 초기화
+    radius  = get_verify_radius(dest_name)
+    dist_km = 0.0
+    if photo_file and gps_data:
+        dist_km = haversine(dest_coord[0], dest_coord[1], gps_data["lat"], gps_data["lon"])
+
     if photo_file and gps_data:
         st.markdown("#### 🗺️ 위치 시각화 지도")
         clat = (dest_coord[0] + gps_data["lat"]) / 2
