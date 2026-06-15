@@ -396,6 +396,23 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
 
+def get_verify_radius(city: str) -> float:
+    """도시 크기에 따라 위치 검증 허용 반경(km)을 반환합니다."""
+    large = {
+        "서울","부산","대구","인천","광주","대전","울산",
+        "세종","수원","창원","고양","용인","성남","부천",
+    }
+    medium = {
+        "청주","전주","천안","안산","안양","평택","의정부",
+        "시흥","파주","김해","포항","춘천","원주","강릉",
+        "제주","서귀포","진주","목포","여수","순천","익산",
+        "군산","구미","경주","안동","광양","아산","화성",
+    }
+    if city in large:  return 20.0
+    if city in medium: return 15.0
+    return 10.0
+
+
 def gate_to_city(name: str):
     key = name.lower().replace(" ","").replace("_","").replace("영업소","").replace("요금소","").replace("tg","")
     if key in TOLLGATE_TO_CITY:
