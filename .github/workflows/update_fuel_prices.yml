@@ -12,11 +12,15 @@ jobs:
   update-fuel-prices:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+
     steps:
       - name: 저장소 체크아웃
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # 전체 히스토리 가져오기
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Python 설치
         uses: actions/setup-python@v5
@@ -30,10 +34,9 @@ jobs:
         run: python scripts/scrape_fuel_prices.py
 
       - name: 변경사항 커밋 & 푸시
-        run: |
-          git config --global user.name  "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
-          git add fuel_prices.json
-          git diff --cached --quiet || git commit -m "🛢️ 유가 자동 업데이트: $(date +'%Y-%m-%d')"
-          git push origin main
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🛢️ 유가 자동 업데이트: ${{ github.run_id }}"
+          file_pattern: fuel_prices.json
+          commit_user_name: github-actions[bot]
+          commit_user_email: github-actions[bot]@users.noreply.github.com
