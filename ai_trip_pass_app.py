@@ -415,32 +415,47 @@ def estimate_distance(origin: str, destination: str) -> float:
 
 def get_opinet_fuel_price(fuel_type: str):
     """
-    GitHub Actions가 매일 업데이트하는 fuel_prices.json을 읽어 유가를 반환합니다.
-    파일이 없거나 오래된 경우 예비 데이터를 사용합니다.
+    유가를 가져옵니다.
+    1순위: GitHub 저장소 fuel_prices.json (raw.githubusercontent.com)
+    2순위: 로컬 fuel_prices.json
+    3순위: 예비 데이터
     """
-    # ── fuel_prices.json 읽기 ─────────────────────
-    json_path = os.path.join(os.path.dirname(__file__), "fuel_prices.json")
+    today = datetime.date.today().strftime("%Y-%m-%d")
+
+    # ── 1순위: GitHub raw로 최신 유가 읽기 ───────
     try:
+        raw_url = (
+            "https://raw.githubusercontent.com/"
+            "pehssg/ai-trip-pass/main/fuel_prices.json"
+        )
+        r = requests.get(raw_url, timeout=6)
+        if r.status_code == 200:
+            data    = r.json()
+            price   = data.get(fuel_type)
+            updated = data.get("updated", "")
+            source  = data.get("source", "GitHub")
+            if price and 400 < int(price) < 4000:
+                freshness = "오늘" if updated == today else f"{updated} 기준"
+                return int(price), f"{freshness} · {source}"
+    except Exception:
+        pass
+
+    # ── 2순위: 로컬 파일 ─────────────────────────
+    try:
+        json_path = os.path.join(os.path.dirname(__file__), "fuel_prices.json")
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        price = data.get(fuel_type)
+        price   = data.get(fuel_type)
         updated = data.get("updated", "")
-        source  = data.get("source", "fuel_prices.json")
-
-        if price and isinstance(price, (int, float)) and 400 < price < 4000:
-            # 업데이트 날짜 표시
-            today = datetime.date.today().strftime("%Y-%m-%d")
+        source  = data.get("source", "로컬")
+        if price and 400 < int(price) < 4000:
             freshness = "오늘" if updated == today else f"{updated} 기준"
-            return int(price), f"오피넷 ({freshness}, {source})"
-
-    except FileNotFoundError:
-        pass
-    except Exception as e:
+            return int(price), f"{freshness} · {source}"
+    except Exception:
         pass
 
-    # ── 폴백: 예비 데이터 ─────────────────────────
-    return FALLBACK_FUEL_PRICES[fuel_type], "예비 데이터 (fuel_prices.json 없음)"
+    # ── 3순위: 예비 데이터 ───────────────────────
+    return FALLBACK_FUEL_PRICES[fuel_type], "예비 데이터"
 
 
 # ══════════════════════════════════════════════
