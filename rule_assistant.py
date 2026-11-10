@@ -220,14 +220,18 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_messages(query: str, proc, hits: list) -> list:
+def build_messages(query: str, proc, hits: list, base_date=None) -> list:
     ctx = []
+    if base_date:
+        ctx.append(f"[기준일] 출장일(영수증 기준) {base_date.isoformat()}, 오늘 {__import__('datetime').date.today().isoformat()} "
+                   "— 기한이 '복귀 후 N일 이내'이면 실제 날짜로 바꿔 알려 줍니다.")
     if proc:
         lines = [f"[업무 절차] {proc['name']}"]
         for s in proc.get("steps", []):
             lines.append(
                 f"{s['order']}. {s['title']} — {s.get('detail','')}"
                 f" / 기한: {s.get('deadline','-')} / 서류: {', '.join(s.get('documents', [])) or '-'}"
+                f" / 서식: {', '.join(s.get('forms', [])) or '-'}"
                 f" / 근거: {', '.join(s.get('basis', [])) or '-'}")
         ctx.append("\n".join(lines))
     if hits:
@@ -245,15 +249,18 @@ def check_citations(answer: str, hits: list) -> list:
     return sorted(cited - known)
 
 
-def fallback_answer(query: str, proc, hits: list) -> str:
-    """LLM 없이 만드는 답변: 절차 + 근거 조문 안내."""
+def fallback_answer(query: str, proc, hits: list, base_date=None) -> str:
+    """LLM 없이 만드는 답변: 절차 + 기한 날짜 + 서식 + 근거 조문 안내."""
     out = []
     if proc:
         out.append(f"**{proc['name']}** 절차로 안내합니다.")
         for s in proc.get("steps", []):
             meta = []
             if s.get("deadline"):
-                meta.append(f"기한 {s['deadline']}")
+                dd = deadline_date(s["deadline"], base_date)
+                meta.append(f"기한 {s['deadline']}" + (f"({format_due(dd)})" if dd else ""))
+            if s.get("forms"):
+                meta.append("서식 " + ", ".join(s["forms"]))
             if s.get("documents"):
                 meta.append("서류 " + ", ".join(s["documents"]))
             if s.get("basis"):
@@ -266,3 +273,126 @@ def fallback_answer(query: str, proc, hits: list) -> str:
         out.append("등록된 규정에서 관련 내용을 찾지 못했습니다. "
                    "'기관 설정' 탭에서 해당 업무의 규정 파일을 추가해 주세요.")
     return "\n".join(out)
+
+
+# ─────────────────────────────────────────────
+# 기한 날짜 계산
+# ─────────────────────────────────────────────
+import datetime as _dt
+
+WEEKDAY = "월화수목금토일"
+
+
+def deadline_date(text: str, base_date):
+    """'복귀 후 7일 이내' 같은 기한을 실제 날짜로 바꿉니다(기준일 없으면 None)."""
+    if not base_date or not text:
+        return None
+    m = re.search(r"(\d+)\s*일\s*(?:이내|안|까지)", text)
+    if m and re.search(r"복귀|출장|후|부터", text):
+        return base_date + _dt.timedelta(days=int(m.group(1)))
+    return None
+
+
+def format_due(d) -> str:
+    left = (d - _dt.date.today()).days
+    tag = f"D-{left}" if left > 0 else ("오늘 마감" if left == 0 else f"{-left}일 지남")
+    return f"{d.month}.{d.day}({WEEKDAY[d.weekday()]})까지 · {tag}"
+
+
+# ─────────────────────────────────────────────
+# 서식 관리
+# ─────────────────────────────────────────────
+FORM_EXT = (".hwpx", ".hwp", ".docx", ".xlsx", ".pdf", ".md", ".txt")
+
+
+def form_title(filename: str) -> str:
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    return re.sub(r"^\[[^\]]*\]\s*", "", stem)          # '[모의]출장명령서' → '출장명령서'
+
+
+def load_form_folder(folder: str) -> list:
+    out = []
+    if os.path.isdir(folder):
+        for fn in sorted(os.listdir(folder)):
+            if fn.lower().endswith(FORM_EXT):
+                out.append({"file": fn, "title": form_title(fn), "path": os.path.join(folder, fn), "builtin": True})
+    return out
+
+
+def match_forms(names: list, forms: list) -> list:
+    """절차에 적힌 서식 이름과 등록된 서식 파일을 이름 일부로 연결합니다."""
+    found = []
+    for n in names:
+        key = n.replace(" ", "")
+        for f in forms:
+            if key and (key in f["title"].replace(" ", "") or f["title"].replace(" ", "") in key):
+                if f not in found:
+                    found.append(f)
+    return found
+
+
+# ─────────────────────────────────────────────
+# 규정에서 절차 초안 만들기
+# ─────────────────────────────────────────────
+DEADLINE_RE = re.compile(r"(?:출발|복귀|출장|납품|검수|신청)?\s*(?:전|후|시)?\s*\d+\s*일\s*(?:이내|안|까지)|출발\s*전|납품\s*시|검수\s*후|당일")
+DOC_RE = re.compile(r"[가-힣]{0,10}(?:요청서|명령서|신청서|확인서|조서|명세서|영수증|견적서|사유서|계획서|보고서|현장사진|증빙서류)")
+STOP = {"목적", "정의", "적용범위", "시행일", "부칙"}
+
+
+def draft_procedure_rule_based(doc: RuleDoc) -> dict:
+    """LLM 없이 조문 순서대로 절차 초안을 만듭니다(담당자가 확인·수정하는 전제)."""
+    steps = []
+    for a in doc.articles:
+        if a.title in STOP or not a.title:
+            continue
+        body = re.sub(r"^제\s*\d+\s*조(?:\s*의\s*\d+)?\s*(?:\([^)]*\))?", "", a.text).strip()
+        first = re.split(r"(?<=다)\.\s|\n", body)[0].strip()
+        dl = DEADLINE_RE.search(body)
+        docs = sorted({d for d in DOC_RE.findall(body) if len(d) >= 3})[:4]
+        steps.append({"order": len(steps) + 1, "title": a.title, "detail": first[:120],
+                      "deadline": dl.group().strip() if dl else "", "documents": docs, "forms": [],
+                      "basis": [f"{doc.title} {a.number}"]})
+    kw = set()
+    for w in re.findall(r"[가-힣]{2,}", doc.title):
+        if any(x in w for x in ("모의", "업무", "처리", "지침", "규정")):
+            continue
+        kw.update({w, w[:2], w[-2:]})
+    kw = sorted(kw)
+    return {"id": f"draft_{abs(hash(doc.title)) % 10**6}", "name": re.sub(r"^\[[^\]]*\]\s*", "", doc.title).replace("업무처리 지침", "").strip() or doc.title,
+            "keywords": kw, "steps": steps, "draft_by": "규칙 기반 초안"}
+
+
+PROC_PROMPT = (
+    "아래 규정 조문만 근거로, 담당자가 실제로 따라 할 업무 절차를 JSON 하나로만 답하세요. 설명·코드블록 표시 없이 JSON만 씁니다.\n"
+    '형식: {"name": "업무 이름", "keywords": ["사용자가 말할 법한 단어"], "steps": [{"order": 1, "title": "할 일", '
+    '"detail": "한 문장 설명", "deadline": "기한(없으면 빈 문자열)", "documents": ["필요 서류"], "forms": ["서식 이름"], '
+    '"basis": ["문서제목 제N조"]}]}\n'
+    "규칙: 조문에 없는 내용은 만들지 않습니다. basis에는 실제 조문 번호만 씁니다. 단계는 시간 순서로 3~8개입니다."
+)
+
+
+def build_procedure_messages(doc: RuleDoc) -> list:
+    body = "\n\n".join(f"<{a.ref}>\n{a.text}" for a in doc.articles)[:9000]
+    return [{"role": "system", "content": PROC_PROMPT},
+            {"role": "user", "content": f"[문서제목] {doc.title}\n\n{body}"}]
+
+
+def parse_procedure_json(text: str, doc: RuleDoc) -> dict:
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        raise ValueError("LLM 응답에서 JSON을 찾지 못했습니다.")
+    proc = json.loads(m.group())
+    known = {a.number for a in doc.articles}
+    for i, st_ in enumerate(proc.get("steps", []), 1):
+        st_["order"] = i
+        for k in ("documents", "forms", "basis"):
+            st_[k] = [x for x in (st_.get(k) or []) if isinstance(x, str)]
+        # 실제로 없는 조문을 근거로 든 경우 표시
+        bad = [b for b in st_["basis"] if (re.search(r"제\s*\d+\s*조(?:\s*의\s*\d+)?", b) or [None])[0] is not None
+               and re.sub(r"\s+", "", re.search(r"제\s*\d+\s*조(?:\s*의\s*\d+)?", b).group()) not in known]
+        if bad:
+            st_["detail"] = (st_.get("detail", "") + f" [근거 확인 필요: {', '.join(bad)}]").strip()
+    proc.setdefault("keywords", [])
+    proc["id"] = f"draft_{abs(hash(doc.title)) % 10**6}"
+    proc["draft_by"] = "LLM 초안"
+    return proc

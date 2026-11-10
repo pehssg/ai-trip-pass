@@ -109,6 +109,11 @@ _init("user_rule_files", {})      # 파일명 → bytes (원본은 읽기만 함
 _init("disabled_docs", [])
 _init("procedures", ra.load_procedures(os.path.join(RULE_DIR, "procedures.json")))
 _init("chat_history", [])
+_init("user_form_files", {})     # 기관이 추가한 서식: 파일명 → bytes
+_init("disabled_forms", [])
+_init("photo_verified", False)   # 현장사진으로 출장 이행 확인됨
+_init("pdf_done", False)         # 출장이행확인서 생성됨
+_init("proc_draft", None)        # 규정에서 만든 절차 초안
 
 # 불러온 기관 설정은 위젯이 그려지기 전에 적용합니다.
 if "_pending_settings" in st.session_state:
@@ -1070,6 +1075,33 @@ def builtin_rule_docs():
     return ra.load_folder(RULE_DIR)
 
 
+FORM_DIR = os.path.join(APP_DIR, "forms")
+
+
+@st.cache_resource(show_spinner=False)
+def builtin_forms():
+    return ra.load_form_folder(FORM_DIR)
+
+
+def active_forms() -> list:
+    forms = [f for f in builtin_forms() if f["file"] not in st.session_state.disabled_forms]
+    for name, data in st.session_state.user_form_files.items():
+        forms.append({"file": name, "title": ra.form_title(name), "data": data, "builtin": False})
+    return forms
+
+
+def form_bytes(f: dict) -> bytes:
+    if "data" in f:
+        return f["data"]
+    with open(f["path"], "rb") as fh:   # 원본은 읽기만 함
+        return fh.read()
+
+
+def trip_base_date():
+    """영수증으로 확인된 출장일(없으면 None) — 기한 날짜 계산 기준."""
+    return _norm_date(st.session_state.get("receipt_trip_date") or "")
+
+
 def active_rule_docs() -> list:
     docs = list(builtin_rule_docs())
     for name, data in st.session_state.user_rule_files.items():
@@ -1117,10 +1149,11 @@ def run_assistant(query: str) -> dict:
     evidence = evidence[:6]
 
     llm = current_llm()
+    base_day = trip_base_date()
     turn = {"q": query, "proc": proc, "evidence": evidence, "warn": [], "engine": llm.label()}
     if llm.enabled:
         try:
-            turn["a"] = llm.chat(ra.build_messages(query, proc, evidence))
+            turn["a"] = llm.chat(ra.build_messages(query, proc, evidence, base_day))
             bad = ra.check_citations(turn["a"], evidence)
             if bad:
                 turn["warn"].append(f"답변에 검색되지 않은 조문({', '.join(bad)})이 인용되어 있습니다. 근거 조문과 대조해 확인하세요.")
@@ -1128,7 +1161,7 @@ def run_assistant(query: str) -> dict:
         except LLMError as e:
             turn["warn"].append(f"LLM 연결 실패({e}) — 규정 검색 결과로 안내합니다.")
             turn["engine"] = "규정 검색 전용 (LLM 연결 실패)"
-    turn["a"] = ra.fallback_answer(query, proc, evidence)
+    turn["a"] = ra.fallback_answer(query, proc, evidence, base_day)
     turn["fallback"] = True
     return turn
 
@@ -1171,8 +1204,46 @@ with tab0:
                 with st.expander(f"업무 절차: {t['proc']['name']}"):
                     st.dataframe(pd.DataFrame([{
                         "순서": s["order"], "할 일": s["title"], "기한": s.get("deadline", ""),
-                        "필요 서류": ", ".join(s.get("documents", [])), "근거": ", ".join(s.get("basis", []))}
+                        "필요 서류": ", ".join(s.get("documents", [])), "서식": ", ".join(s.get("forms", [])),
+                        "근거": ", ".join(s.get("basis", []))}
                         for s in t["proc"]["steps"]]), hide_index=True, use_container_width=True)
+            if t.get("proc"):
+                _names = []
+                for _s in t["proc"].get("steps", []):
+                    for _n in _s.get("forms", []):
+                        if _n not in _names:
+                            _names.append(_n)
+                if _names:
+                    st.markdown("**📎 필요한 서식**")
+                    _forms = active_forms()
+                    _fc = st.columns(min(len(_names), 3))
+                    for _k, _n in enumerate(_names):
+                        _m = ra.match_forms([_n], _forms)
+                        with _fc[_k % len(_fc)]:
+                            if _m:
+                                st.download_button(f"⬇️ {_m[0]['title']}", data=form_bytes(_m[0]), file_name=_m[0]["file"],
+                                                   key=f"form_{i}_{_k}_{_m[0]['file']}", use_container_width=True)
+                            elif "출장이행확인서" in _n:
+                                st.caption(f"📄 {_n}: '영수증 처리' 또는 '현장사진' 탭에서 자동 작성")
+                            else:
+                                st.caption(f"📄 {_n}: 등록된 서식 없음 → '기관 설정'에서 추가")
+                if i == 0 and any(_s.get("check") or _s.get("deadline") for _s in t["proc"].get("steps", [])):
+                    _done = {"receipt": bool(st.session_state.get("receipt_trip_date")),
+                             "photo": st.session_state.photo_verified, "pdf": st.session_state.pdf_done}
+                    _bd = trip_base_date()
+                    _lines, _next = [], None
+                    for _s in t["proc"]["steps"]:
+                        ok_ = _done.get(_s.get("check"), False)
+                        if not ok_ and _next is None:
+                            _next = _s
+                        _dd = ra.deadline_date(_s.get("deadline", ""), _bd)
+                        _due = f" · {ra.format_due(_dd)}" if _dd else ""
+                        _lines.append(f"{'✅' if ok_ else ('👉' if _s is _next else '⬜')} {_s['order']}. {_s['title']}{_due}")
+                    with st.container(border=True):
+                        st.markdown("**📌 지금 진행 상황**" + (f" (출장일 {_bd.month}.{_bd.day} 기준)" if _bd else " (영수증을 올리면 기한 날짜가 계산됩니다)"))
+                        st.markdown("  \n".join(_lines))
+                        if _next:
+                            st.caption(f"다음 할 일: {_next['title']} — {_next.get('detail', '')}")
             if t["evidence"]:
                 with st.expander(f"근거 조문 {len(t['evidence'])}건"):
                     for a, sc in t["evidence"]:
@@ -1452,6 +1523,7 @@ with tab1:
                                file_name=fname, mime="application/pdf",
                                use_container_width=True)
             st.success("✅ PDF 생성 완료")
+            st.session_state.pdf_done = True
             st.session_state.submitted_trips.append({
                 "제출일": datetime.date.today().strftime("%Y-%m-%d"),
                 "출장일": st.session_state.trip_date,
@@ -1546,6 +1618,8 @@ with tab2:
             far = best_point["d"]
             
             ok_points = [p_ for p_ in valid_points if p_["ok"]]
+            if ok_points:
+                st.session_state.photo_verified = True
             if trip_dest and ok_points:
                 far = max(p_["d"] for p_ in ok_points)
                 st.success(f"✅ 출장 이행 확인 — {base_name}에서 약 {far:.0f}km 떨어진 출장지({trip_dest}) 방문이 "
@@ -1631,6 +1705,7 @@ with tab2:
                 route_text=f"{st.session_state.base_city} → {basis['city']} : {one_way:.1f}km (사진 위치 기준)",
                 distance=round_km, car_model=vf2["car_model"], fuel_type=vf2["fuel_type"],
                 fuel_price=vf2["price"], toll_fee=int(toll2), total_cost=total2, fuel_source=vf2["label"])
+            st.session_state.pdf_done = True
             st.download_button("⬇️ PDF 다운로드", data=pdf2, use_container_width=True, mime="application/pdf",
                                file_name=f"출장이행확인서_사진기준_{_date_txt.replace('.', '')}.pdf")
             st.session_state.submitted_trips.append({
@@ -1851,6 +1926,35 @@ with tab4:
         st.caption("'제N조(제목)' 형식의 조문은 조문 단위로, 그 밖의 문서는 단락 단위로 나눠 검색합니다.")
         st.markdown('</div>', unsafe_allow_html=True)
 
+        # ── 서식 관리 ─────────────────────────
+        st.markdown('<div class="card"><div class="card-title">서식 관리</div>', unsafe_allow_html=True)
+        _all_forms = list(builtin_forms()) + [{"file": n, "title": ra.form_title(n), "builtin": False}
+                                              for n in st.session_state.user_form_files]
+        for f in _all_forms:
+            c1, c2, c3 = st.columns([6, 2, 2])
+            if f["builtin"]:
+                use = c1.checkbox(f["title"], value=f["file"] not in st.session_state.disabled_forms, key=f"useform_{f['file']}")
+                if use and f["file"] in st.session_state.disabled_forms:
+                    st.session_state.disabled_forms.remove(f["file"])
+                elif not use and f["file"] not in st.session_state.disabled_forms:
+                    st.session_state.disabled_forms.append(f["file"])
+                c2.caption("기본 탑재")
+            else:
+                c1.write(f"☑ {f['title']}")
+                c2.caption("추가 서식")
+                if c3.button("삭제", key=f"delform_{f['file']}"):
+                    st.session_state.user_form_files.pop(f["file"], None)
+                    st.rerun()
+        fups = st.file_uploader("기관 서식 추가 (hwpx, hwp, docx, xlsx, pdf)", type=["hwpx", "hwp", "docx", "xlsx", "pdf"],
+                                accept_multiple_files=True, key="form_uploader")
+        for u in fups or []:
+            if u.name not in st.session_state.user_form_files:
+                st.session_state.user_form_files[u.name] = u.getvalue()
+                st.rerun()
+        st.caption("업무 절차의 '서식' 이름과 파일 이름 일부가 같으면 서무비서가 해당 단계에서 내려받기를 제공합니다. "
+                   "같은 이름의 서식을 추가하면 기관 서식이 함께 표시됩니다.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
         # ── 업무 절차 ─────────────────────────
         st.markdown('<div class="card"><div class="card-title">업무 절차</div>', unsafe_allow_html=True)
         st.write(", ".join(p["name"] for p in st.session_state.procedures) or "등록된 절차가 없습니다.")
@@ -1866,6 +1970,55 @@ with tab4:
                     st.success(f"절차 {len(new_procs)}종을 적용했습니다.")
             except ValueError:
                 st.error("JSON 형식이 올바르지 않습니다.")
+        st.markdown("**규정에서 절차 초안 만들기**")
+        _docs = active_rule_docs()
+        if _docs:
+            _sel = st.selectbox("규정 선택", [d.title for d in _docs], key="draft_doc")
+            _engine = "LLM" if current_llm().enabled else "규칙 기반(LLM 미연결)"
+            if st.button(f"절차 초안 만들기 · {_engine}"):
+                _doc = next(d for d in _docs if d.title == _sel)
+                _draft, _err = None, None
+                if current_llm().enabled:
+                    try:
+                        with st.spinner("LLM이 조문을 읽고 절차를 정리하는 중..."):
+                            _draft = ra.parse_procedure_json(current_llm().chat(ra.build_procedure_messages(_doc),
+                                                                                max_tokens=1600), _doc)
+                    except Exception as e:
+                        _err = f"LLM 초안 실패({str(e)[:80]}) — 규칙 기반 초안으로 대신합니다."
+                if _draft is None:
+                    _draft = ra.draft_procedure_rule_based(_doc)
+                if _err:
+                    st.warning(_err)
+                st.session_state.proc_draft = _draft
+        _dr = st.session_state.proc_draft
+        if _dr:
+            st.caption(f"{_dr.get('draft_by', '초안')} — 담당자가 확인·수정한 뒤 적용하세요.")
+            _dname = st.text_input("업무 이름", value=_dr.get("name", ""), key=f"dn_{_dr['id']}")
+            _dkw = st.text_input("인식 단어(쉼표로 구분)", value=", ".join(_dr.get("keywords", [])), key=f"dk_{_dr['id']}")
+            _df = pd.DataFrame([{"할 일": s_.get("title", ""), "설명": s_.get("detail", ""), "기한": s_.get("deadline", ""),
+                                 "필요 서류": ", ".join(s_.get("documents", [])), "서식": ", ".join(s_.get("forms", [])),
+                                 "근거": ", ".join(s_.get("basis", []))} for s_ in _dr.get("steps", [])])
+            _ed = st.data_editor(_df, num_rows="dynamic", hide_index=True, use_container_width=True, key=f"de_{_dr['id']}")
+            a1, a2 = st.columns(2)
+            if a1.button("업무 절차에 적용", type="primary"):
+                _split = lambda v: [x.strip() for x in str(v or "").split(",") if x.strip()]
+                _steps = []
+                for _, r_ in _ed.iterrows():
+                    if str(r_.get("할 일") or "").strip():
+                        _steps.append({"order": len(_steps) + 1, "title": str(r_["할 일"]).strip(),
+                                       "detail": str(r_.get("설명") or ""), "deadline": str(r_.get("기한") or ""),
+                                       "documents": _split(r_.get("필요 서류")), "forms": _split(r_.get("서식")),
+                                       "basis": _split(r_.get("근거"))})
+                _new = {"id": _dr["id"], "name": _dname.strip() or _dr.get("name", "새 업무"),
+                        "keywords": _split(_dkw), "steps": _steps}
+                st.session_state.procedures = [p_ for p_ in st.session_state.procedures
+                                               if p_.get("name") != _new["name"] and p_.get("id") != _new["id"]] + [_new]
+                st.session_state.proc_draft = None
+                st.success(f"'{_new['name']}' 절차({len(_steps)}단계)를 적용했습니다.")
+                st.rerun()
+            if a2.button("초안 버리기"):
+                st.session_state.proc_draft = None
+                st.rerun()
         if st.button("기본 절차로 되돌리기"):
             st.session_state.procedures = ra.load_procedures(os.path.join(RULE_DIR, "procedures.json"))
             st.rerun()
