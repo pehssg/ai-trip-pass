@@ -609,8 +609,9 @@ def extract_pdf_receipts(file_bytes: bytes) -> list[str]:
                     )
                     # 영수증이 포함된 컬럼만 추가 (KEC 또는 영업소 포함 여부로 판단)
                     if re.search(r"영업소|KEC|통행료|\d종\s*\d", col_text):
-                        # 컬럼 안에 여러 영수증이 있을 수 있으므로 블록 분리
-blocks = re.split(r"(?=\d{4}년\d{2}월\d{2}일\s*\d{2}시\d{2}분|한국도로공사\s+\S+영업소|하이패스는)", col_text)                        for block in blocks:
+                        # 컬럼 안에 여러 영수증이 있을 수 있으므로 블록 분리 (수정 반영)
+                        blocks = re.split(r"(?=\d{4}년\d{2}월\d{2}일\s*\d{2}시\d{2}분|한국도로공사\s+\S+영업소|하이패스는)", col_text)
+                        for block in blocks:
                             if re.search(r"KEC|종\s*[\d,]+\s*원|영업소", block):
                                 receipt_texts.append(block.strip())
         return receipt_texts
@@ -701,22 +702,83 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
     # ── 시간순 정렬 ──────────────────────────────
     receipts.sort(key=lambda r: r["datetime"] or datetime.datetime.max)
 
+    # (이 부분이 잘려나가서 오류가 났었습니다 - 복구)
     if not receipts:
-is_total = len(receipts) >= 2 or bool(total_m)
+        return {
+            "trip_date": datetime.date.today().strftime("%Y.%m.%d"), "toll_fee": 0, "toll_detail": [],
+            "origin_gate": "-", "dest_gate": "-", "origin_city": None, "dest_city": None,
+            "ocr_text": text[:300],
+            "method": "인식 실패 — 한국도로공사 하이패스 영수증 양식을 찾지 못했습니다",
+            "is_total": True, "failed": True,
+        }
 
-return {
-    "trip_date":   trip_date,
-    "toll_fee":    total_toll,
-    "toll_detail": receipts,
-    "origin_gate": origin_gate,
-    "dest_gate":   dest_gate,
-    "origin_city": origin_city,
-    "dest_city":   dest_city,
-    "ocr_text":    f"영수증 {len(receipts)}건 인식 | 출발: {origin_gate}({first.get('시각','')}) → 도착: {dest_gate}({last.get('시각','')})",
-    "method":      f"pdfplumber 컬럼 분리 파싱 (무료) — {len(receipts)}건",
-    "is_total":    is_total,
-}
+    # ── 통행료 합계 ──────────────────────────────
+    total_toll = sum(r["금액"] for r in receipts)
+    # 총액 텍스트로 검증
+    total_m = re.search(r"총\s*\d+\s*건\s*/\s*([\d,]+)\s*원", text)
+    if total_m:
+        total_toll = int(total_m.group(1).replace(",", ""))
 
+    # ── 출장일: 가장 이른 날짜 ─────────────────
+    first = receipts[0] if receipts else {}
+    trip_date = first.get("날짜") or datetime.date.today().strftime("%Y.%m.%d")
+
+    # ── 출발 요금소: 가장 이른 시각의 입구영업소 ─
+    origin_gate = first.get("입구영업소") or first.get("영업소") or "출발요금소"
+
+    # ── 목적지 판단 로직 ──────────────────────────
+    middle_receipts = [r for r in receipts if not r.get("입구영업소")]
+
+    if middle_receipts:
+        has_dt = [r for r in middle_receipts if r.get("datetime")]
+        if has_dt and first.get("datetime") and receipts[-1].get("datetime"):
+            start_dt = first["datetime"]
+            end_dt   = receipts[-1]["datetime"]
+            mid_dt   = start_dt + (end_dt - start_dt) / 2
+            closest  = min(has_dt,
+                           key=lambda r: abs((r["datetime"] - mid_dt).total_seconds()))
+            dest_gate = closest.get("영업소") or "도착요금소"
+        else:
+            from collections import Counter
+            names = [r["영업소"].replace("영업소","").strip() for r in middle_receipts]
+            dest_gate = Counter(names).most_common(1)[0][0] + "영업소"
+    else:
+        dest_gate = receipts[0].get("영업소") or "도착요금소"
+
+    # ── 도시 매핑 ────────────────────────────────
+    def find_city(gate):
+        city = gate_to_city(gate)
+        if city:
+            return city
+        gate_clean = gate.replace("영업소","").replace("한국도로공사","").strip()
+        city = gate_to_city(gate_clean)
+        if city:
+            return city
+        for c in cities:
+            if c in gate:
+                return c
+        return None
+
+    origin_city = find_city(origin_gate)
+    dest_city   = find_city(dest_gate)
+
+    last = receipts[-1] if receipts else {}
+
+    # (수정 반영: 정상적인 위치로 이동됨) 영수증 2건 이상이거나 총액 텍스트가 있으면 왕복으로 처리
+    is_total = len(receipts) >= 2 or bool(total_m)
+
+    return {
+        "trip_date":   trip_date,
+        "toll_fee":    total_toll,
+        "toll_detail": receipts,
+        "origin_gate": origin_gate,
+        "dest_gate":   dest_gate,
+        "origin_city": origin_city,
+        "dest_city":   dest_city,
+        "ocr_text":    f"영수증 {len(receipts)}건 인식 | 출발: {origin_gate}({first.get('시각','')}) → 도착: {dest_gate}({last.get('시각','')})",
+        "method":      f"pdfplumber 컬럼 분리 파싱 (무료) — {len(receipts)}건",
+        "is_total":    is_total,
+    }
     # ── 통행료 합계 ──────────────────────────────
     total_toll = sum(r["금액"] for r in receipts)
     # 총액 텍스트로 검증
