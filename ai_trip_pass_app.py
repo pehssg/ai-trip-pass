@@ -104,7 +104,7 @@ _init("ref_fuel_date", datetime.date.today())
 _init("road_factor", 1.3)
 _init("radius_mode", "도시 규모별 자동 (10·15·20km)")
 _init("radius_fixed", 10.0)
-_init("auto_approve_limit", 150000)
+_init("auto_approve_limit", 300000)
 _init("user_rule_files", {})      # 파일명 → bytes (원본은 읽기만 함)
 _init("disabled_docs", [])
 _init("procedures", ra.load_procedures(os.path.join(RULE_DIR, "procedures.json")))
@@ -114,13 +114,21 @@ _init("disabled_forms", [])
 _init("photo_verified", False)   # 현장사진으로 출장 이행 확인됨
 _init("pdf_done", False)         # 출장이행확인서 생성됨
 _init("proc_draft", None)        # 규정에서 만든 절차 초안
+# 여비 기준표 — 공무원 여비 규정 별표 기준으로 기관 담당자가 확인·수정 (기본값은 확인 필요)
+_init("allow_daily", 25000)      # 일비(1일)
+_init("allow_meal", 25000)       # 식비(1일)
+_init("lodge_seoul", 100000)     # 숙박비 상한(1박): 서울특별시
+_init("lodge_metro", 80000)      # 숙박비 상한(1박): 광역시
+_init("lodge_other", 70000)      # 숙박비 상한(1박): 그 밖의 지역
+_init("local_over4", 20000)      # 근무지 내 출장 4시간 이상
+_init("local_under4", 10000)     # 근무지 내 출장 4시간 미만
 
 # 불러온 기관 설정은 위젯이 그려지기 전에 적용합니다.
 if "_pending_settings" in st.session_state:
     _ps = st.session_state.pop("_pending_settings")
     for _k in ["llm_preset", "llm_base_url", "llm_model", "ref_fuel_gasoline", "ref_fuel_diesel",
                "ref_fuel_lpg", "road_factor", "radius_mode", "radius_fixed", "auto_approve_limit",
-               "disabled_docs", "base_name", "base_city", "base_lat", "base_lon"]:
+               "disabled_docs", "base_name", "base_city", "base_lat", "base_lon", "allow_daily", "allow_meal", "lodge_seoul", "lodge_metro", "lodge_other", "local_over4", "local_under4"]:
         if _k in _ps:
             st.session_state[_k] = _ps[_k]
     try:
@@ -621,6 +629,44 @@ def get_fuel_price_for_date(fuel_type: str, date_str: str):
     return price, label + (" · 출장일 유가 없음" if d else "")
 
 
+# ── 일비·식비·숙박비 ──────────────────────────────
+METRO_CITIES = {"부산", "대구", "인천", "광주", "대전", "울산", "세종"}
+
+
+def lodging_group(city: str) -> str:
+    if city == "서울":
+        return "서울특별시"
+    return "광역시" if city in METRO_CITIES else "그 밖의 지역"
+
+
+def lodging_cap(city: str) -> int:
+    g = lodging_group(city)
+    key = {"서울특별시": "lodge_seoul", "광역시": "lodge_metro"}.get(g, "lodge_other")
+    return int(st.session_state[key])
+
+
+def calc_allowance(days: int, nights: int, lodging_paid: int, city: str,
+                   official_car: bool = False, local: bool = False, over4: bool = True) -> dict:
+    """일비·식비·숙박비 계산(금액 기준은 기관 설정의 여비 기준표)."""
+    ss = st.session_state
+    if local:
+        amt = int(ss.local_over4 if over4 else ss.local_under4)
+        return {"daily": 0, "meal": 0, "lodging": 0, "local": amt, "total": amt, "days": 1, "nights": 0,
+                "lines": [f"근무지 내 출장({'4시간 이상' if over4 else '4시간 미만'}) {amt:,}원"]}
+    daily = int(ss.allow_daily) * days
+    if official_car:
+        daily //= 2
+    meal = int(ss.allow_meal) * days
+    cap = lodging_cap(city) * nights
+    lodging = min(int(lodging_paid), cap) if nights else 0
+    lines = [f"일비 {int(ss.allow_daily):,}원 × {days}일" + (" × 1/2(관용차)" if official_car else "") + f" = {daily:,}원",
+             f"식비 {int(ss.allow_meal):,}원 × {days}일 = {meal:,}원"]
+    if nights:
+        lines.append(f"숙박비 실비 {int(lodging_paid):,}원 (상한 {lodging_group(city)} {lodging_cap(city):,}원 × {nights}박 = {cap:,}원) → {lodging:,}원")
+    return {"daily": daily, "meal": meal, "lodging": lodging, "local": 0, "total": daily + meal + lodging,
+            "days": days, "nights": nights, "lines": lines}
+
+
 def get_opinet_fuel_price(fuel_type: str):
     """호환용 별칭"""
     return get_reference_fuel_price(fuel_type)
@@ -972,7 +1018,7 @@ def load_korean_font():
 # ══════════════════════════════════════════════
 def generate_trip_pdf(trip_date, destination, route_text, distance,
                       car_model, fuel_type, fuel_price, toll_fee,
-                      total_cost, fuel_source="") -> bytes:
+                      total_cost, fuel_source="", fuel_cost=None, allow=None) -> bytes:
     fonts = load_korean_font()
     F, FB = fonts["regular"], fonts["bold"]
     buf = io.BytesIO()
@@ -986,7 +1032,7 @@ def generate_trip_pdf(trip_date, destination, route_text, distance,
     c.setFont(F, 10);  c.drawCentredString(W/2, H-63, "AI-Trip Pass 자동 생성 문서")
 
     y = H - 108
-    lh = 27
+    lh = 23
 
     def sec(title, yy):
         c.setFillColorRGB(0.93,0.96,1.0)
@@ -1020,8 +1066,21 @@ def generate_trip_pdf(trip_date, destination, route_text, distance,
 
     y -= 8
     y = sec("[ 비용 내역 ]", y)
-    y = row("유류비",          f"{total_cost - toll_fee:,.0f} 원", y)
+    allow = allow or {}
+    if fuel_cost is None:
+        fuel_cost = total_cost - toll_fee - allow.get("total", 0)
+    y = row("유류비",          f"{fuel_cost:,.0f} 원", y)
     y = row("통행료 (왕복)",   f"{toll_fee:,} 원", y)
+    if allow:
+        if allow.get("local"):
+            y = row("근무지 내 출장비", f"{allow['local']:,} 원", y)
+        else:
+            y = row("일비",   f"{allow.get('daily', 0):,} 원 ({allow.get('days', 1)}일)", y)
+            y = row("식비",   f"{allow.get('meal', 0):,} 원", y)
+            if allow.get("nights"):
+                y = row("숙박비", f"{allow.get('lodging', 0):,} 원 ({allow['nights']}박, 지역별 상한 적용)", y)
+        if allow.get("period"):
+            y = row("출장 기간", allow["period"], y)
 
     y -= 10
     bh = 52
@@ -1131,6 +1190,34 @@ def render_vehicle_fuel(prefix: str, fuel_day: str) -> dict:
     st.caption(f"기준: {label}")
     return {"car_model": car_model, "efficiency": efficiency, "fuel_type": fuel_type,
             "price": int(price), "label": label}
+
+
+def render_allowance(prefix: str, city, start_default) -> dict:
+    """출장 기간·숙박 입력 → 일비·식비·숙박비(영수증 탭과 현장사진 탭이 같은 화면을 씀)."""
+    st.markdown("**🧾 일비 · 식비 · 숙박비**")
+    start_default = start_default or datetime.date.today()
+    d1, d2 = st.columns(2)
+    start = d1.date_input("출발일", value=start_default, key=f"{prefix}_start_{start_default}")
+    end = d2.date_input("귀임일", value=start_default, key=f"{prefix}_end_{start_default}")
+    if end < start:
+        st.warning("귀임일이 출발일보다 빠릅니다. 출발일과 같은 날로 계산합니다.")
+        end = start
+    days, nights = (end - start).days + 1, (end - start).days
+    local = st.checkbox("근무지 내 출장 (기관 소재지와 같은 시·군)", key=f"{prefix}_local_{city}",
+                        value=bool(city) and city == st.session_state.base_city)
+    over4, official, paid = True, False, 0
+    if local:
+        over4 = st.radio("출장 시간", ["4시간 이상", "4시간 미만"], horizontal=True, key=f"{prefix}_hours") == "4시간 이상"
+    else:
+        official = st.checkbox("관용차량 이용 (일비 1/2)", key=f"{prefix}_official")
+        if nights:
+            paid = st.number_input(f"실제 숙박비 합계 (원) · {nights}박", min_value=0, step=1000,
+                                   value=lodging_cap(city or "") * nights, key=f"{prefix}_lodge_{nights}",
+                                   help="숙박 영수증 금액을 넣으면 지역별 상한액까지 지급합니다.")
+    res = calc_allowance(days, nights, paid, city or "", official, local, over4)
+    st.caption(" · ".join(res["lines"]) + f"  →  **소계 {res['total']:,}원**")
+    res["period"] = f"{start:%Y.%m.%d}" + ("" if days == 1 else f" ~ {end:%Y.%m.%d} ({nights}박 {days}일)")
+    return res
 
 
 def run_assistant(query: str) -> dict:
@@ -1458,8 +1545,9 @@ with tab1:
         )
         st.session_state.toll_fee = toll
 
+        allow1 = render_allowance("t1", destination, trip_base_date())
         fuel_cost  = (distance_km / efficiency) * st.session_state.fuel_price
-        total_cost = fuel_cost + toll
+        total_cost = fuel_cost + toll + allow1["total"]
         st.session_state.fuel_cost  = fuel_cost
         st.session_state.total_cost = total_cost
 
@@ -1481,15 +1569,14 @@ with tab1:
                         unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        fp = int(fuel_cost / total_cost * 100) if total_cost > 0 else 0
         st.markdown(f"""
         <div class="final-amount">
-          <div class="label">💰 최종 청구 금액 (유류비 + 통행료)</div>
+          <div class="label">💰 최종 청구 금액 (유류비 + 통행료 + 일비·식비·숙박비)</div>
           <div class="amount">{total_cost:,.0f} 원</div>
-          <div style="display:flex;justify-content:center;gap:16px;margin-top:8px;font-size:.8rem">
-            <span style="color:#388e3c">유류비 {fuel_cost:,.0f}원 ({fp}%)</span>
-            <span style="color:#888">+</span>
-            <span style="color:#1565c0">통행료 {toll:,.0f}원 ({100-fp}%)</span>
+          <div style="display:flex;justify-content:center;flex-wrap:wrap;gap:12px;margin-top:8px;font-size:.8rem">
+            <span style="color:#388e3c">유류비 {fuel_cost:,.0f}원</span>
+            <span style="color:#1565c0">통행료 {toll:,.0f}원</span>
+            <span style="color:#6a1b9a">일비·식비·숙박비 {allow1['total']:,.0f}원</span>
           </div>
           <div style="color:#388e3c;font-size:.75rem;margin-top:4px">
             ({distance_km}km ÷ {efficiency}km/L × {int(st.session_state.fuel_price):,}원/L) + 통행료 왕복
@@ -1517,6 +1604,8 @@ with tab1:
                     toll_fee    = int(st.session_state.toll_fee),
                     total_cost  = st.session_state.total_cost,
                     fuel_source = st.session_state.get("fuel_source",""),
+                    fuel_cost   = fuel_cost,
+                    allow       = allow1,
                 )
             fname = f"출장이행확인서_{st.session_state.trip_date.replace('.','')}.pdf"
             st.download_button("⬇️ PDF 다운로드", data=pdf_bytes,
@@ -1532,6 +1621,7 @@ with tab1:
                 "차종": car_model,
                 "유류비(원)": round(fuel_cost),
                 "통행료(원)": int(toll),
+                "일비·식비·숙박비(원)": int(allow1["total"]),
                 "청구금액(원)": round(total_cost),
                 "상태": "자동 승인 (Pass)" if total_cost < st.session_state.auto_approve_limit else "수기 확인 필요 (Alert)",
             })
@@ -1683,19 +1773,21 @@ with tab2:
         with c_r:
             _day2 = basis.get("shot") or st.session_state.get("receipt_trip_date") or ""
             vf2 = render_vehicle_fuel("t2", _day2)
+        allow2 = render_allowance("t2", trip_dest or basis["city"], _norm_date(_day2) if _day2 else trip_base_date())
         liters = round_km / vf2["efficiency"] if vf2["efficiency"] else 0
         fuel2 = liters * vf2["price"]
-        total2 = fuel2 + toll2
-        m1, m2, m3 = st.columns(3)
+        total2 = fuel2 + toll2 + allow2["total"]
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("유류비", f"{fuel2:,.0f}원", f"{liters:.1f}L 소비", delta_color="off")
         m2.metric("통행료", f"{toll2:,.0f}원")
-        m3.metric("왕복 거리", f"{round_km:.0f}km")
+        m3.metric("일비·식비·숙박비", f"{allow2['total']:,.0f}원")
+        m4.metric("왕복 거리", f"{round_km:.0f}km")
         st.markdown(f"""
         <div class="final-amount">
-          <div class="label">💰 사진 기준 청구 금액 (유류비 + 통행료)</div>
+          <div class="label">💰 사진 기준 청구 금액 (유류비 + 통행료 + 일비·식비·숙박비)</div>
           <div class="amount">{total2:,.0f} 원</div>
           <div style="color:#388e3c;font-size:.75rem;margin-top:4px">
-            ({round_km}km ÷ {vf2['efficiency']}km/L × {vf2['price']:,}원/L) + 통행료 {toll2:,.0f}원
+            ({round_km}km ÷ {vf2['efficiency']}km/L × {vf2['price']:,}원/L) + 통행료 {toll2:,.0f}원 + 일비·식비·숙박비 {allow2['total']:,.0f}원
           </div>
         </div>""", unsafe_allow_html=True)
         if st.button("📄 이 금액으로 출장이행확인서 PDF 생성", key="t2_pdf", use_container_width=True):
@@ -1704,14 +1796,16 @@ with tab2:
                 trip_date=_date_txt, destination=trip_dest or basis["city"],
                 route_text=f"{st.session_state.base_city} → {basis['city']} : {one_way:.1f}km (사진 위치 기준)",
                 distance=round_km, car_model=vf2["car_model"], fuel_type=vf2["fuel_type"],
-                fuel_price=vf2["price"], toll_fee=int(toll2), total_cost=total2, fuel_source=vf2["label"])
+                fuel_price=vf2["price"], toll_fee=int(toll2), total_cost=total2, fuel_source=vf2["label"],
+                fuel_cost=fuel2, allow=allow2)
             st.session_state.pdf_done = True
             st.download_button("⬇️ PDF 다운로드", data=pdf2, use_container_width=True, mime="application/pdf",
                                file_name=f"출장이행확인서_사진기준_{_date_txt.replace('.', '')}.pdf")
             st.session_state.submitted_trips.append({
                 "제출일": datetime.date.today().strftime("%Y-%m-%d"), "출장일": _date_txt,
                 "출장지": trip_dest or basis["city"], "이동거리(km)": round_km, "차종": vf2["car_model"],
-                "유류비(원)": round(fuel2), "통행료(원)": int(toll2), "청구금액(원)": round(total2),
+                "유류비(원)": round(fuel2), "통행료(원)": int(toll2), "일비·식비·숙박비(원)": int(allow2["total"]),
+                "청구금액(원)": round(total2),
                 "상태": "자동 승인 (Pass)" if (_ok_pts and total2 < st.session_state.auto_approve_limit)
                         else "수기 확인 필요 (Alert)",
             })
@@ -1820,7 +1914,7 @@ def _fill_base_coord():
 
 SETTING_KEYS = ["llm_preset", "llm_base_url", "llm_model", "ref_fuel_gasoline", "ref_fuel_diesel",
                 "ref_fuel_lpg", "road_factor", "radius_mode", "radius_fixed", "auto_approve_limit",
-                "disabled_docs", "base_name", "base_city", "base_lat", "base_lon"]
+                "disabled_docs", "base_name", "base_city", "base_lat", "base_lon", "allow_daily", "allow_meal", "lodge_seoul", "lodge_metro", "lodge_other", "local_over4", "local_under4"]
 
 with tab4:
     st.caption("기관마다 다른 기준을 여기서 정합니다. 설정은 파일로 내보내고 다시 불러올 수 있습니다(API 키는 내보내지 않음).")
@@ -1894,6 +1988,22 @@ with tab4:
         if st.session_state.radius_mode.startswith("고정"):
             st.number_input("고정 반경 (km)", 1.0, 50.0, step=1.0, key="radius_fixed")
         st.number_input("자동 승인 기준 금액 (원 미만)", 0, 10_000_000, step=10_000, key="auto_approve_limit")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── 여비 기준표 ───────────────────────
+        st.markdown('<div class="card"><div class="card-title">여비 기준표 (일비·식비·숙박비)</div>', unsafe_allow_html=True)
+        a1, a2 = st.columns(2)
+        a1.number_input("일비 (1일, 원)", 0, 1_000_000, step=1000, key="allow_daily")
+        a2.number_input("식비 (1일, 원)", 0, 1_000_000, step=1000, key="allow_meal")
+        l1, l2, l3 = st.columns(3)
+        l1.number_input("숙박 상한 · 서울 (1박)", 0, 1_000_000, step=5000, key="lodge_seoul")
+        l2.number_input("숙박 상한 · 광역시 (1박)", 0, 1_000_000, step=5000, key="lodge_metro")
+        l3.number_input("숙박 상한 · 그 밖 (1박)", 0, 1_000_000, step=5000, key="lodge_other")
+        n1, n2 = st.columns(2)
+        n1.number_input("근무지 내 출장 4시간 이상", 0, 1_000_000, step=1000, key="local_over4")
+        n2.number_input("근무지 내 출장 4시간 미만", 0, 1_000_000, step=1000, key="local_under4")
+        st.caption("기본값은 시연용입니다. 「공무원 여비 규정」 국내 여비 지급표와 기관 지침의 최신 금액으로 확인해 입력하세요. "
+                   "광역시 상한은 부산·대구·인천·광주·대전·울산·세종에 적용합니다.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with s_right:
