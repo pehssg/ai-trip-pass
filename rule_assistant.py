@@ -108,7 +108,7 @@ def split_articles(doc_title: str, text: str) -> list:
 
 def load_doc(filename: str, data: bytes, builtin: bool = True) -> RuleDoc:
     text = read_text(filename, data)
-    title = os.path.splitext(os.path.basename(filename))[0]
+    title = _nfc(os.path.splitext(os.path.basename(filename))[0])
     m = re.search(r"(?m)^#\s+(.+)$", text)
     if m:
         title = m.group(1).strip()
@@ -305,8 +305,14 @@ def format_due(d) -> str:
 FORM_EXT = (".hwpx", ".hwp", ".docx", ".xlsx", ".pdf", ".md", ".txt")
 
 
+def _nfc(text: str) -> str:
+    """한글 파일명 정규화(macOS 등에서 올린 자모 분리형 이름도 같은 글자로 인식)."""
+    import unicodedata
+    return unicodedata.normalize("NFC", text or "")
+
+
 def form_title(filename: str) -> str:
-    stem = os.path.splitext(os.path.basename(filename))[0]
+    stem = _nfc(os.path.splitext(os.path.basename(filename))[0])
     return re.sub(r"^\[[^\]]*\]\s*", "", stem)          # '[모의]출장명령서' → '출장명령서'
 
 
@@ -315,7 +321,7 @@ def load_form_folder(folder: str) -> list:
     if os.path.isdir(folder):
         for fn in sorted(os.listdir(folder)):
             if fn.lower().endswith(FORM_EXT):
-                out.append({"file": fn, "title": form_title(fn), "path": os.path.join(folder, fn), "builtin": True})
+                out.append({"file": _nfc(fn), "title": form_title(fn), "path": os.path.join(folder, fn), "builtin": True})
     return out
 
 
@@ -323,9 +329,10 @@ def match_forms(names: list, forms: list) -> list:
     """절차에 적힌 서식 이름과 등록된 서식 파일을 이름 일부로 연결합니다."""
     found = []
     for n in names:
-        key = n.replace(" ", "")
+        key = _nfc(n).replace(" ", "")
         for f in forms:
-            if key and (key in f["title"].replace(" ", "") or f["title"].replace(" ", "") in key):
+            title = _nfc(f["title"]).replace(" ", "")
+            if key and (key in title or title in key):
                 if f not in found:
                     found.append(f)
     return found
