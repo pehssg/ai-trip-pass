@@ -15,6 +15,12 @@ from reportlab.pdfbase.ttfonts import TTFont
 import warnings
 warnings.filterwarnings("ignore")
 
+from llm_client import LLMClient, LLMError, PRESETS
+import rule_assistant as ra
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+RULE_DIR = os.path.join(APP_DIR, "regulations")
+
 # ══════════════════════════════════════════════
 # 페이지 설정
 # ══════════════════════════════════════════════
@@ -47,8 +53,8 @@ st.markdown("""
 
 st.markdown("""
 <div class="header-banner">
-  <h1>🚗 AI-Trip Pass</h1>
-  <p>출장 행정 자동화 시스템 · 영수증 OCR · 위치 증빙 · 관리자 대시보드</p>
+  <h1>🚗 출장 서무비서 AI-Trip Pass</h1>
+  <p>출장 규정 안내부터 영수증 산정, 현장사진 위치 확인, 출장이행확인서 작성까지 한 번에</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -73,6 +79,43 @@ _init("fuel_price", 1650)
 _init("fuel_source", "")
 _init("car_model", "아반떼")
 _init("submitted_trips", [])
+
+# ── 기관 설정 (설정 탭에서 변경, JSON으로 내보내기·불러오기) ──
+def _secret(name, default=""):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+_init("llm_preset", "사용 안 함 (규정 검색만)" if not _secret("LLM_BASE_URL") else "OpenAI 호환 API (직접 입력)")
+_init("llm_base_url", _secret("LLM_BASE_URL"))
+_init("llm_model", _secret("LLM_MODEL"))
+_init("llm_api_key", _secret("LLM_API_KEY"))
+_init("ref_fuel_gasoline", 1652)
+_init("ref_fuel_diesel", 1498)
+_init("ref_fuel_lpg", 963)
+_init("ref_fuel_date", datetime.date.today())
+_init("road_factor", 1.3)
+_init("radius_mode", "도시 규모별 자동 (10·15·20km)")
+_init("radius_fixed", 10.0)
+_init("auto_approve_limit", 150000)
+_init("user_rule_files", {})      # 파일명 → bytes (원본은 읽기만 함)
+_init("disabled_docs", [])
+_init("procedures", ra.load_procedures(os.path.join(RULE_DIR, "procedures.json")))
+_init("chat_history", [])
+
+# 불러온 기관 설정은 위젯이 그려지기 전에 적용합니다.
+if "_pending_settings" in st.session_state:
+    _ps = st.session_state.pop("_pending_settings")
+    for _k in ["llm_preset", "llm_base_url", "llm_model", "ref_fuel_gasoline", "ref_fuel_diesel",
+               "ref_fuel_lpg", "road_factor", "radius_mode", "radius_fixed", "auto_approve_limit",
+               "disabled_docs"]:
+        if _k in _ps:
+            st.session_state[_k] = _ps[_k]
+    try:
+        st.session_state.ref_fuel_date = datetime.date.fromisoformat(_ps.get("ref_fuel_date", ""))
+    except (ValueError, TypeError):
+        pass
 
 # ══════════════════════════════════════════════
 # 상수
@@ -423,11 +466,60 @@ def gate_to_city(name: str):
     return None
 
 
+def estimate_one_way_km(origin: str, destination: str, factor: float = 1.3) -> float:
+    """두 시·군 좌표 간 직선거리 × 도로계수로 편도 도로거리를 추정합니다(최소 5km)."""
+    a = DESTINATION_COORDS.get(origin)
+    b = DESTINATION_COORDS.get(destination)
+    if not a or not b:
+        return 50.0
+    return round(max(haversine(a[0], a[1], b[0], b[1]) * factor, 5.0), 1)
+
+
 def estimate_distance(origin: str, destination: str) -> float:
-    d_o = DISTANCE_FROM_SEOUL.get(origin, 0)
-    d_d = DISTANCE_FROM_SEOUL.get(destination, 50)
-    one_way = abs(d_d - d_o) if d_o != d_d else d_d
-    return round((one_way or d_d) * 2, 1)
+    """왕복 거리(km) — 호환용"""
+    return round(estimate_one_way_km(origin, destination, st.session_state.get("road_factor", 1.3)) * 2, 1)
+
+
+def verify_radius(city: str) -> float:
+    """위치 검증 허용 반경 — 기관 설정을 따릅니다."""
+    if st.session_state.get("radius_mode", "").startswith("고정"):
+        return float(st.session_state.get("radius_fixed", 10.0))
+    return get_verify_radius(city)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_opinet_json():
+    """GitHub Actions가 갱신하는 fuel_prices.json (실패 시 로컬 파일)."""
+    try:
+        r = requests.get("https://raw.githubusercontent.com/pehssg/ai-trip-pass/main/fuel_prices.json", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(APP_DIR, "fuel_prices.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+FUEL_KEYS = {"휘발유": "ref_fuel_gasoline", "경유": "ref_fuel_diesel", "LPG": "ref_fuel_lpg"}
+
+
+def get_reference_fuel_price(fuel_type: str):
+    """적용 기준 유가: 오피넷 자동 갱신값이 유효하면 사용, 아니면 기관 기준 유가(관리자 설정)."""
+    data = load_opinet_json() or {}
+    src = str(data.get("source", ""))
+    price = data.get(fuel_type)
+    if price and "오피넷" in src and "예비" not in src and 400 < int(price) < 4000:
+        return int(price), f"오피넷 전국 평균 ({data.get('updated', '')})"
+    ref_date = st.session_state.get("ref_fuel_date", datetime.date.today())
+    return int(st.session_state[FUEL_KEYS[fuel_type]]), f"기관 기준 유가 (관리자 설정, {ref_date})"
+
+
+def get_opinet_fuel_price(fuel_type: str):
+    """호환용 별칭"""
+    return get_reference_fuel_price(fuel_type)
 
 
 def get_opinet_fuel_price(fuel_type: str):
@@ -643,7 +735,8 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
             names = [r["영업소"].replace("영업소","").strip() for r in middle_receipts]
             dest_gate = Counter(names).most_common(1)[0][0] + "영업소"
     else:
-        dest_gate = receipts[-1].get("영업소") or "도착요금소"
+        # 폐쇄식 구간만 있는 경우: 가장 이른 영수증의 영업소(갈 때 나간 곳)가 목적지
+        dest_gate = receipts[0].get("영업소") or "도착요금소"
 
     # ── 도시 매핑 ────────────────────────────────
     def find_city(gate):
@@ -711,34 +804,44 @@ def extract_exif_gps(image: Image.Image):
 # ══════════════════════════════════════════════
 @st.cache_resource
 def load_korean_font():
-    paths = {
-        "NanumGothic":     "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-        "NanumGothicBold": "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
-    }
-    for name, path in paths.items():
-        try:
-            if os.path.exists(path):
-                pdfmetrics.registerFont(TTFont(name, path))
-        except Exception:
-            pass
+    """한글 글꼴 등록: 리눅스 나눔고딕 → Windows 맑은 고딕 → 나눔고딕 내려받기 순."""
+    candidates = [
+        ("/usr/share/fonts/truetype/nanum/NanumGothic.ttf", "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf"),
+        (os.path.join(APP_DIR, "fonts", "NanumGothic-Regular.ttf"), os.path.join(APP_DIR, "fonts", "NanumGothic-Bold.ttf")),
+        ("C:/Windows/Fonts/malgun.ttf", "C:/Windows/Fonts/malgunbd.ttf"),
+    ]
 
-    if not os.path.exists(paths["NanumGothic"]):
+    def _register(reg, bold):
         try:
-            import subprocess
-            subprocess.run(["apt-get","install","-y","fonts-nanum"],
-                           capture_output=True, timeout=60)
-            for name, path in paths.items():
-                if os.path.exists(path):
-                    try: pdfmetrics.registerFont(TTFont(name, path))
-                    except Exception: pass
+            pdfmetrics.registerFont(TTFont("KR", reg))
+            pdfmetrics.registerFont(TTFont("KRB", bold if os.path.exists(bold) else reg))
+            return True
         except Exception:
-            pass
+            return False
 
-    try: pdfmetrics.getFont("NanumGothic"); F = "NanumGothic"
-    except Exception: F = "Helvetica"
-    try: pdfmetrics.getFont("NanumGothicBold"); FB = "NanumGothicBold"
-    except Exception: FB = "Helvetica-Bold"
-    return {"regular": F, "bold": FB}
+    for reg, bold in candidates:
+        if os.path.exists(reg) and _register(reg, bold):
+            return {"regular": "KR", "bold": "KRB"}
+
+    # 마지막 수단: 나눔고딕을 내려받아 사용 (SIL OFL)
+    try:
+        font_dir = os.path.join(os.path.expanduser("~"), ".tripass_fonts")
+        os.makedirs(font_dir, exist_ok=True)
+        base = "https://raw.githubusercontent.com/google/fonts/main/ofl/nanumgothic/"
+        files = {}
+        for key, fn in (("reg", "NanumGothic-Regular.ttf"), ("bold", "NanumGothic-Bold.ttf")):
+            path = os.path.join(font_dir, fn)
+            if not os.path.exists(path):
+                r = requests.get(base + fn, timeout=20)
+                if r.status_code == 200:
+                    with open(path, "wb") as f:
+                        f.write(r.content)
+            files[key] = path
+        if os.path.exists(files["reg"]) and _register(files["reg"], files["bold"]):
+            return {"regular": "KR", "bold": "KRB"}
+    except Exception:
+        pass
+    return {"regular": "Helvetica", "bold": "Helvetica-Bold"}
 
 
 # ══════════════════════════════════════════════
@@ -826,11 +929,123 @@ def generate_trip_pdf(trip_date, destination, route_text, distance,
 # ══════════════════════════════════════════════
 # 탭 구성
 # ══════════════════════════════════════════════
-tab1, tab2, tab3 = st.tabs([
-    "📄 Tab 1 · 영수증 처리 & 출장이행확인서",
-    "📍 Tab 2 · 사진 EXIF 위치 증빙",
-    "📊 Tab 3 · 관리자 대시보드",
+tab0, tab1, tab2, tab3, tab4 = st.tabs([
+    "💬 출장 서무비서",
+    "📄 영수증 처리 · 확인서 작성",
+    "📍 현장사진 위치 증빙",
+    "📊 관리자 대시보드",
+    "⚙️ 기관 설정",
 ])
+
+
+# ──────────────────────────────────────────────
+# 공통: 답변 엔진과 규정 색인
+# ──────────────────────────────────────────────
+def current_llm() -> LLMClient:
+    if st.session_state.llm_preset.startswith("사용 안 함"):
+        return LLMClient("", "")
+    return LLMClient(st.session_state.llm_base_url, st.session_state.llm_model, st.session_state.llm_api_key)
+
+
+@st.cache_resource(show_spinner=False)
+def builtin_rule_docs():
+    return ra.load_folder(RULE_DIR)
+
+
+def active_rule_docs() -> list:
+    docs = list(builtin_rule_docs())
+    for name, data in st.session_state.user_rule_files.items():
+        try:
+            docs.append(ra.load_doc(name, data, builtin=False))
+        except Exception:
+            pass
+    return [d for d in docs if d.name not in st.session_state.disabled_docs]
+
+
+def run_assistant(query: str) -> dict:
+    docs = active_rule_docs()
+    articles = [a for d in docs for a in d.articles]
+    index = ra.RuleIndex(articles) if articles else None
+    proc = ra.match_procedure(query, st.session_state.procedures)
+
+    evidence = []
+    if proc:
+        evidence = [(a, "절차 근거") for a in ra.basis_articles(proc, articles)]
+    if index:
+        for a, sc in index.search(query, k=4):
+            if all(a is not e for e, _ in evidence):
+                evidence.append((a, sc))
+    evidence = evidence[:6]
+
+    llm = current_llm()
+    turn = {"q": query, "proc": proc, "evidence": evidence, "warn": [], "engine": llm.label()}
+    if llm.enabled:
+        try:
+            turn["a"] = llm.chat(ra.build_messages(query, proc, evidence))
+            bad = ra.check_citations(turn["a"], evidence)
+            if bad:
+                turn["warn"].append(f"답변에 검색되지 않은 조문({', '.join(bad)})이 인용되어 있습니다. 근거 조문과 대조해 확인하세요.")
+            return turn
+        except LLMError as e:
+            turn["warn"].append(f"LLM 연결 실패({e}) — 규정 검색 결과로 안내합니다.")
+            turn["engine"] = "규정 검색 전용 (LLM 연결 실패)"
+    turn["a"] = ra.fallback_answer(query, proc, evidence)
+    turn["fallback"] = True
+    return turn
+
+
+# ──────────────────────────────────────────────
+# TAB 0 — 출장 서무비서
+# ──────────────────────────────────────────────
+with tab0:
+    st.markdown('<div class="card"><div class="card-title">출장 서무비서</div>', unsafe_allow_html=True)
+    st.write("상황을 말하면 해야 할 일의 순서·기한·필요 서류와 근거 조문을 안내합니다. 계산과 서류 작성은 다음 탭에서 이어집니다.")
+    llm_now = current_llm()
+    st.caption(f"답변 엔진: {llm_now.label()}  |  등록 규정 {len(active_rule_docs())}건  |  업무 절차 {len(st.session_state.procedures)}종")
+
+    examples = ["출장 다녀와서 정산해야 해요", "자가용으로 출장 가도 되나요?",
+                "정산은 언제까지 해야 하나요?", "사무용품을 사야 해요"]
+    ex_cols = st.columns(len(examples))
+    for col, ex in zip(ex_cols, examples):
+        if col.button(ex, use_container_width=True, key=f"ex_{ex}"):
+            st.session_state.pending_query = ex
+
+    with st.form("ask_form", clear_on_submit=True):
+        fq1, fq2 = st.columns([5, 1])
+        typed = fq1.text_input("질문", placeholder="예: 출장 다녀와서 정산해야 해요", label_visibility="collapsed")
+        sent = fq2.form_submit_button("물어보기", use_container_width=True)
+    query = typed.strip() if sent and typed.strip() else st.session_state.pop("pending_query", None)
+    if query:
+        with st.spinner("규정과 절차를 찾는 중..."):
+            st.session_state.chat_history.insert(0, run_assistant(query))
+
+    if not st.session_state.chat_history:
+        st.info("위 예시를 누르거나 상황을 입력해 보세요.")
+    for i, t in enumerate(st.session_state.chat_history):
+        with st.chat_message("user"):
+            st.write(t["q"])
+        with st.chat_message("assistant"):
+            st.markdown(t["a"])
+            for w in t["warn"]:
+                st.warning(w)
+            if t.get("proc") and not t.get("fallback"):
+                with st.expander(f"업무 절차: {t['proc']['name']}"):
+                    st.dataframe(pd.DataFrame([{
+                        "순서": s["order"], "할 일": s["title"], "기한": s.get("deadline", ""),
+                        "필요 서류": ", ".join(s.get("documents", [])), "근거": ", ".join(s.get("basis", []))}
+                        for s in t["proc"]["steps"]]), hide_index=True, use_container_width=True)
+            if t["evidence"]:
+                with st.expander(f"근거 조문 {len(t['evidence'])}건"):
+                    for a, sc in t["evidence"]:
+                        st.markdown(f"**{a.doc} {a.heading}**  ·  {'절차에 연결된 근거' if sc == '절차 근거' else f'검색 점수 {sc}'}")
+                        st.markdown("> " + a.text.replace("\n", "\n> "))
+            st.caption(f"답변 엔진: {t['engine']}")
+        if i == 0 and len(st.session_state.chat_history) > 1:
+            st.divider()
+    if st.session_state.chat_history and st.button("대화 지우기"):
+        st.session_state.chat_history = []
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────
@@ -963,11 +1178,17 @@ with tab1:
 
         st.session_state.destination = destination
         st.session_state.dest_coord  = DESTINATION_COORDS.get(destination, (37.5665,126.9780))
-        distance_km = estimate_distance(origin, destination)
+        _factor = float(st.session_state.road_factor)
+        auto_km = estimate_one_way_km(origin, destination, _factor)
+        one_way_km = st.number_input(
+            "편도 거리 (km)", min_value=0.0, max_value=1000.0, value=float(auto_km), step=1.0,
+            key=f"km_{origin}_{destination}_{_factor}",
+            help="두 지역 좌표의 직선거리에 도로계수를 곱해 추정합니다. 실제 경로와 다르면 수정하세요.")
+        distance_km = round(one_way_km * 2, 1)
         st.session_state.trip_distance = distance_km
-        st.session_state.route_text = f"{origin} → {destination} : {distance_km/2:.1f}km"
-
-        st.info(f"📏 예상 왕복 이동거리: **{distance_km} km** (편도 {distance_km/2:.1f} km)")
+        st.session_state.route_text = f"{origin} → {destination} : {one_way_km:.1f}km"
+        _edited = "출장자 수정" if abs(one_way_km - auto_km) > 0.05 else f"자동 추정(직선거리 × {_factor})"
+        st.info(f"📏 왕복 이동거리: **{distance_km} km** (편도 {one_way_km:.1f} km · {_edited})")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col_right:
@@ -984,34 +1205,14 @@ with tab1:
         st.session_state.fuel_type  = fuel_type
         st.session_state.car_model  = car_model
 
-        # 자동으로 fuel_prices.json에서 현재 유가 로드
-        _auto_price, _auto_source = get_opinet_fuel_price(fuel_type)
-        if st.session_state.fuel_price == 1650:   # 초기값이면 자동 반영
-            st.session_state.fuel_price  = _auto_price
-            st.session_state.fuel_source = _auto_source
-
-        cb1, cb2 = st.columns([1,2])
-        with cb1:
-            if st.button("🔄 유가 새로고침", use_container_width=True):
-                price, source = get_opinet_fuel_price(fuel_type)
-                st.session_state.fuel_price  = price
-                st.session_state.fuel_source = source
-                if "예비" in source:
-                    st.warning(f"⚠️ {source}: {price:,}원/L")
-                else:
-                    st.success(f"✅ {source}: {price:,}원/L")
-        with cb2:
-            manual = st.number_input("유가 직접 입력 (원/L)", min_value=500, max_value=3000,
-                                     value=int(st.session_state.fuel_price), step=10)
-            st.session_state.fuel_price = manual
-
-        # 현재 유가 출처 표시
-        _src = st.session_state.get("fuel_source", "")
-        if _src:
-            if "예비" in _src:
-                st.caption(f"⚠️ {_src} — GitHub Actions 설정 후 자동 업데이트됩니다")
-            else:
-                st.caption(f"✅ {_src}")
+        # 기준 유가: 오피넷 자동 갱신값 또는 기관 기준 유가(기관 설정 탭)
+        ref_price, ref_label = get_reference_fuel_price(fuel_type)
+        manual = st.number_input("적용 유가 (원/L)", min_value=500, max_value=3000,
+                                 value=int(ref_price), step=10, key=f"fuel_{fuel_type}_{ref_price}",
+                                 help="기준 유가가 자동으로 들어갑니다. 출장일 유가가 다르면 수정하세요.")
+        st.session_state.fuel_price = manual
+        st.session_state.fuel_source = ref_label if manual == ref_price else f"출장자 수정값 (기준 {ref_price:,}원/L)"
+        st.caption(f"기준: {st.session_state.fuel_source}")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1096,7 +1297,7 @@ with tab1:
                 "유류비(원)": round(fuel_cost),
                 "통행료(원)": int(toll),
                 "청구금액(원)": round(total_cost),
-                "상태": "자동 승인 (Pass)" if total_cost < 150000 else "수기 확인 필요 (Alert)",
+                "상태": "자동 승인 (Pass)" if total_cost < st.session_state.auto_approve_limit else "수기 확인 필요 (Alert)",
             })
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1137,7 +1338,7 @@ with tab2:
     with col_result:
         if photo_file and gps_data:
             dist_km = haversine(dest_coord[0], dest_coord[1], gps_data["lat"], gps_data["lon"])
-            radius  = get_verify_radius(dest_name)
+            radius  = verify_radius(dest_name)
 
             st.markdown("#### 📏 위치 검증 결과")
             m1, m2 = st.columns(2)
@@ -1157,7 +1358,7 @@ with tab2:
                 )
 
     # 지도 섹션에서 radius/dist_km 사용 — 기본값 먼저 초기화
-    radius  = get_verify_radius(dest_name)
+    radius  = verify_radius(dest_name)
     dist_km = 0.0
     if photo_file and gps_data:
         dist_km = haversine(dest_coord[0], dest_coord[1], gps_data["lat"], gps_data["lon"])
@@ -1262,3 +1463,121 @@ with tab3:
     st.download_button("📥 CSV 다운로드", data=csv,
                        file_name=f"출장기록_{datetime.date.today()}.csv", mime="text/csv")
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────
+# TAB 4 — 기관 설정
+# ──────────────────────────────────────────────
+def _apply_preset():
+    p = PRESETS.get(st.session_state.llm_preset, {})
+    if p.get("base_url") or st.session_state.llm_preset.startswith("사용 안 함"):
+        st.session_state.llm_base_url = p.get("base_url", "")
+        st.session_state.llm_model = p.get("model", "")
+
+
+SETTING_KEYS = ["llm_preset", "llm_base_url", "llm_model", "ref_fuel_gasoline", "ref_fuel_diesel",
+                "ref_fuel_lpg", "road_factor", "radius_mode", "radius_fixed", "auto_approve_limit",
+                "disabled_docs"]
+
+with tab4:
+    st.caption("기관마다 다른 기준을 여기서 정합니다. 설정은 파일로 내보내고 다시 불러올 수 있습니다(API 키는 내보내지 않음).")
+    s_left, s_right = st.columns([1, 1], gap="large")
+
+    with s_left:
+        # ── 답변 엔진 ─────────────────────────
+        st.markdown('<div class="card"><div class="card-title">답변 엔진 (LLM)</div>', unsafe_allow_html=True)
+        st.selectbox("모델 선택", list(PRESETS.keys()), key="llm_preset", on_change=_apply_preset)
+        disabled = st.session_state.llm_preset.startswith("사용 안 함")
+        st.text_input("API 주소 (OpenAI 호환)", key="llm_base_url", disabled=disabled,
+                      placeholder="예: http://localhost:11434/v1")
+        st.text_input("모델명", key="llm_model", disabled=disabled, placeholder="예: gemma3:4b")
+        st.text_input("API 키 (필요한 경우)", key="llm_api_key", type="password", disabled=disabled)
+        if st.button("연결 테스트", disabled=disabled):
+            ok, msg = current_llm().ping()
+            (st.success if ok else st.error)(msg)
+        st.caption("OpenAI 호환 규격이면 주소와 모델명만 바꿔 다른 모델로 교체됩니다. "
+                   "연결하지 않아도 서무비서는 규정 검색으로 절차와 근거를 안내합니다.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── 산정·검증 기준 ─────────────────────
+        st.markdown('<div class="card"><div class="card-title">산정·검증 기준</div>', unsafe_allow_html=True)
+        f1, f2, f3 = st.columns(3)
+        f1.number_input("휘발유 (원/L)", 500, 3000, step=10, key="ref_fuel_gasoline")
+        f2.number_input("경유 (원/L)", 500, 3000, step=10, key="ref_fuel_diesel")
+        f3.number_input("LPG (원/L)", 300, 3000, step=10, key="ref_fuel_lpg")
+        st.date_input("기준 유가 기준일", key="ref_fuel_date")
+        _oj = load_opinet_json() or {}
+        if "오피넷" in str(_oj.get("source", "")) and "예비" not in str(_oj.get("source", "")):
+            st.caption(f"오피넷 자동 갱신값({_oj.get('updated')})이 있으면 그 값이 우선 적용됩니다.")
+        st.slider("도로계수 (직선거리 → 도로거리)", 1.0, 1.6, step=0.05, key="road_factor")
+        st.radio("위치 검증 허용 반경", ["도시 규모별 자동 (10·15·20km)", "고정 반경"],
+                 key="radius_mode", horizontal=True)
+        if st.session_state.radius_mode.startswith("고정"):
+            st.number_input("고정 반경 (km)", 1.0, 50.0, step=1.0, key="radius_fixed")
+        st.number_input("자동 승인 기준 금액 (원 미만)", 0, 10_000_000, step=10_000, key="auto_approve_limit")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    with s_right:
+        # ── 규정·지침 관리 ─────────────────────
+        st.markdown('<div class="card"><div class="card-title">규정·지침 관리</div>', unsafe_allow_html=True)
+        all_docs = list(builtin_rule_docs())
+        for name, data in st.session_state.user_rule_files.items():
+            try:
+                all_docs.append(ra.load_doc(name, data, builtin=False))
+            except Exception as e:
+                st.error(f"{name}: 읽을 수 없습니다 ({e})")
+        for d in all_docs:
+            c1, c2, c3 = st.columns([6, 2, 2])
+            use = c1.checkbox(f"{d.title} · 조문 {len(d.articles)}개", value=d.name not in st.session_state.disabled_docs,
+                              key=f"use_{d.name}")
+            c2.caption("기본 탑재" if d.builtin else "추가 파일")
+            if use and d.name in st.session_state.disabled_docs:
+                st.session_state.disabled_docs.remove(d.name)
+            elif not use and d.name not in st.session_state.disabled_docs:
+                st.session_state.disabled_docs.append(d.name)
+            if not d.builtin and c3.button("삭제", key=f"del_{d.name}"):
+                st.session_state.user_rule_files.pop(d.name, None)
+                st.rerun()
+        ups = st.file_uploader("규정·지침 파일 추가 (md, txt, pdf, hwpx)", type=["md", "txt", "pdf", "hwpx"],
+                               accept_multiple_files=True, key="rule_uploader")
+        for u in ups or []:
+            if u.name not in st.session_state.user_rule_files:
+                st.session_state.user_rule_files[u.name] = u.getvalue()   # 원본은 읽기만 함
+                st.rerun()
+        st.caption("'제N조(제목)' 형식의 조문은 조문 단위로, 그 밖의 문서는 단락 단위로 나눠 검색합니다.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── 업무 절차 ─────────────────────────
+        st.markdown('<div class="card"><div class="card-title">업무 절차</div>', unsafe_allow_html=True)
+        st.write(", ".join(p["name"] for p in st.session_state.procedures) or "등록된 절차가 없습니다.")
+        st.download_button("절차 파일 내려받기 (JSON)",
+                           json.dumps({"procedures": st.session_state.procedures}, ensure_ascii=False, indent=2),
+                           file_name="procedures.json", mime="application/json")
+        pf = st.file_uploader("수정한 절차 파일 적용", type=["json"], key="proc_uploader")
+        if pf is not None:
+            try:
+                new_procs = json.loads(pf.getvalue().decode("utf-8")).get("procedures", [])
+                if new_procs and new_procs != st.session_state.procedures:
+                    st.session_state.procedures = new_procs
+                    st.success(f"절차 {len(new_procs)}종을 적용했습니다.")
+            except ValueError:
+                st.error("JSON 형식이 올바르지 않습니다.")
+        if st.button("기본 절차로 되돌리기"):
+            st.session_state.procedures = ra.load_procedures(os.path.join(RULE_DIR, "procedures.json"))
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── 설정 내보내기·불러오기 ───────────────
+        st.markdown('<div class="card"><div class="card-title">설정 내보내기·불러오기</div>', unsafe_allow_html=True)
+        export = {k: st.session_state[k] for k in SETTING_KEYS}
+        export["ref_fuel_date"] = str(st.session_state.ref_fuel_date)
+        st.download_button("기관 설정 내려받기", json.dumps(export, ensure_ascii=False, indent=2),
+                           file_name="tripass_settings.json", mime="application/json")
+        sf = st.file_uploader("기관 설정 불러오기", type=["json"], key="settings_uploader")
+        if sf is not None and st.button("불러온 설정 적용"):
+            try:
+                st.session_state._pending_settings = json.loads(sf.getvalue().decode("utf-8"))
+                st.rerun()
+            except (ValueError, TypeError):
+                st.error("설정 파일 형식이 올바르지 않습니다.")
+        st.markdown('</div>', unsafe_allow_html=True)
