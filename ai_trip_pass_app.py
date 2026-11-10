@@ -578,7 +578,7 @@ def get_opinet_fuel_price(fuel_type: str):
 def extract_pdf_receipts(file_bytes: bytes) -> list[str]:
     """
     pdfplumber로 PDF를 컬럼별로 분리해 각 영수증 텍스트 리스트를 반환합니다.
-    (개선: 블록 분리 기준을 '한국도로공사'로 단순화하여 누락 방지)
+    열 경계는 '한국도로공사' 글자 위치로 자동 판단하고, 영수증 머리글('하이패스는') 단위로 나눕니다.
     """
     try:
         import pdfplumber
@@ -589,16 +589,21 @@ def extract_pdf_receipts(file_bytes: bytes) -> list[str]:
                 if not words:
                     continue
                 W = page.width
-                col_w = W / 3
+                # 영수증 열 경계: '한국도로공사' 글자의 시작 위치(열마다 하나)로 찾고, 못 찾으면 3등분
+                starts = []
+                for x in sorted(w['x0'] for w in words if w['text'] == "한국도로공사"):
+                    if not starts or x - starts[-1] > 40:
+                        starts.append(x)
+                bounds = [x - 8 for x in starts[1:]] if len(starts) >= 2 else [W / 3, W * 2 / 3]
+                ncol = len(bounds) + 1
 
-                # x 좌표 기준으로 3컬럼 분리
-                cols = {0: [], 1: [], 2: []}
+                cols = {i: [] for i in range(ncol)}
                 for w in words:
-                    c = min(int(w['x0'] // col_w), 2)
+                    c = sum(1 for b in bounds if w['x0'] >= b)
                     cols[c].append(w)
 
-                # 컬럼별 → y 순서로 텍스트 재조합
-                for c in [0, 1, 2]:
+                # 열별 → y 순서로 텍스트 재조합
+                for c in range(ncol):
                     lines = {}
                     for w in cols[c]:
                         y = round(w['top'] / 4) * 4  # 4px 단위 그룹핑
@@ -608,10 +613,15 @@ def extract_pdf_receipts(file_bytes: bytes) -> list[str]:
                         for y in sorted(lines)
                     )
                     
-                    # '한국도로공사'가 나타날 때마다 영수증 블록을 확실하게 분리
-                    blocks = re.split(r"(?=한국도로공사\s)", col_text)
+                    # 1차: '하이패스는'(영수증 머리글) 기준 분리 → 2차: 한 블록에 영수증이 둘 이상이면 '한국도로공사' 기준 분리
+                    blocks = []
+                    for big in re.split(r"(?=하이패스는)", col_text):
+                        if big.count("한국도로공사") > 1:
+                            blocks.extend(re.split(r"(?=한국도로공사\s)", big))
+                        else:
+                            blocks.append(big)
                     for block in blocks:
-                        # 영업소 이름과 금액(숫자+원)이 모두 존재하는 블록만 유효한 영수증으로 취급
+                        # 영업소 이름과 금액(숫자+원)이 모두 있는 블록만 유효한 영수증으로 취급
                         if "영업소" in block and re.search(r"\d+(?:,\d+)*\s*원", block):
                             receipt_texts.append(block.strip())
         return receipt_texts
@@ -693,7 +703,10 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
         entries  = re.findall(r"입구영업소\s*:\s*([가-힣a-zA-Z0-9]+)", text)
         
         # 금액 백업 파싱 (다양한 양식 대응)
-        amts_raw = re.findall(r"(?:KEC|\d\s*종|통행료|합\s*계)\s*([\d,]+)\s*원", text)
+        # 영수증마다 '1 종'과 'KEC'에 같은 금액이 두 번 찍히므로 한 종류만 사용(중복 합산 방지)
+        amts_raw = (re.findall(r"KEC\s*([\d,]+)\s*원", text)
+                    or re.findall(r"\d\s*종\s*([\d,]+)\s*원", text)
+                    or re.findall(r"(?:통행료|합\s*계)\s*([\d,]+)\s*원", text))
         amounts  = [int(a.replace(",", "")) for a in amts_raw]
         
         for i, office in enumerate(offices):
@@ -722,8 +735,10 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
     # ── 통행료 합계 (영수증 수만큼 모두 자동 합산) ──────
     total_toll = sum(r["금액"] for r in receipts)
     total_m = re.search(r"총\s*\d+\s*건\s*/\s*([\d,]+)\s*원", text)
-    if total_toll == 0 and total_m:
-        total_toll = int(total_m.group(1).replace(",", ""))
+    if total_m:
+        printed_total = int(total_m.group(1).replace(",", ""))
+        if printed_total != total_toll:
+            total_toll = printed_total   # 영수증에 인쇄된 총액이 가장 정확함
 
     # ── 출장일 및 요금소 판단 ─────────────────
     first = receipts[0] if receipts else {}
@@ -731,8 +746,13 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
     origin_gate = first.get("입구영업소") or first.get("영업소") or "출발요금소"
 
     dest_gate = "도착요금소"
+    middle = [r for r in receipts if not r.get("입구영업소") and r.get("datetime")]
     if len(receipts) == 1:
         dest_gate = receipts[0].get("영업소") or "도착요금소"
+    elif middle and first.get("datetime") and receipts[-1].get("datetime"):
+        # 개방식 구간(입구영업소 없는 영수증)이 있으면, 출발~귀환 시간의 중간점에 가장 가까운 요금소가 목적지
+        mid_dt = first["datetime"] + (receipts[-1]["datetime"] - first["datetime"]) / 2
+        dest_gate = min(middle, key=lambda r: abs((r["datetime"] - mid_dt).total_seconds())).get("영업소") or "도착요금소"
     else:
         # 여러 장(왕복)이면 출발 요금소와 이름이 다른 첫 번째 요금소를 실제 목적지로 판단
         for r in receipts:
@@ -1421,8 +1441,11 @@ with tab2:
             guess = best_point["city"]
             far = best_point["d"]
             
-            if trip_dest == guess:
-                st.success(f"✅ 출장 이행 확인 — {base_name}에서 약 {far:.0f}km 떨어진 출장지({trip_dest}) 방문이 확인되었습니다.")
+            ok_points = [p_ for p_ in valid_points if p_["ok"]]
+            if trip_dest and ok_points:
+                far = max(p_["d"] for p_ in ok_points)
+                st.success(f"✅ 출장 이행 확인 — {base_name}에서 약 {far:.0f}km 떨어진 출장지({trip_dest}) 방문이 "
+                           f"사진 {len(ok_points)}장으로 확인되었습니다.")
             else:
                 msg = f"사진의 GPS 위치로 보아 **{guess}** 인근을 다녀온 것으로 추정됩니다."
                 if trip_dest:
