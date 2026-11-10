@@ -70,6 +70,26 @@ class LLMClient:
         # 추론형 모델의 <think> 블록 제거
         return _THINK.sub("", text).strip()
 
+    def list_models(self) -> list:
+        """OpenAI 호환 /models 목록(Ollama·Google AI Studio·vLLM 등 지원). 실패 시 LLMError."""
+        if not self.base_url:
+            raise LLMError("API 주소가 비어 있습니다.")
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        try:
+            r = requests.get(f"{self.base_url}/models", headers=headers, timeout=20)
+        except requests.RequestException as e:
+            raise LLMError(f"연결 실패: {e.__class__.__name__}") from e
+        if r.status_code != 200:
+            raise LLMError(f"HTTP {r.status_code}: {r.text[:200]}")
+        try:
+            data = r.json().get("data", [])
+        except ValueError as e:
+            raise LLMError("모델 목록 형식이 OpenAI 호환 규격과 다릅니다.") from e
+        ids = [str(m.get("id", "")).replace("models/", "", 1) for m in data if m.get("id")]
+        # 임베딩·이미지·음성 전용 모델은 대화에 쓸 수 없으므로 뒤로 보냄
+        skip = ("embed", "imagen", "veo", "tts", "aqa", "audio", "image")
+        return sorted(ids, key=lambda x: (any(k in x for k in skip), x))
+
     def ping(self) -> tuple:
         """연결 테스트: (성공여부, 메시지)"""
         try:

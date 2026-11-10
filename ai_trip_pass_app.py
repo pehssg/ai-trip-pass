@@ -1760,6 +1760,20 @@ with tab4:
                       placeholder="예: http://localhost:11434/v1")
         st.text_input("모델명", key="llm_model", disabled=disabled, placeholder="예: gemma3:4b")
         st.text_input("API 키 (필요한 경우)", key="llm_api_key", type="password", disabled=disabled)
+        def _pick_model():
+            if st.session_state.get("_model_pick"):
+                st.session_state.llm_model = st.session_state._model_pick
+        if st.button("사용 가능한 모델 목록 불러오기", disabled=disabled):
+            try:
+                st.session_state._model_list = LLMClient(st.session_state.llm_base_url, "x",
+                                                         st.session_state.llm_api_key).list_models()
+                if not st.session_state._model_list:
+                    st.warning("목록이 비어 있습니다. API 키 권한을 확인하세요.")
+            except LLMError as e:
+                st.error(f"목록을 받지 못했습니다: {e}")
+        if st.session_state.get("_model_list"):
+            st.selectbox("목록에서 모델 고르기 (고르면 모델명 칸에 바로 들어감)",
+                         [""] + st.session_state._model_list, key="_model_pick", on_change=_pick_model)
         if st.button("연결 테스트", disabled=disabled):
             ok, msg = current_llm().ping()
             (st.success if ok else st.error)(msg)
