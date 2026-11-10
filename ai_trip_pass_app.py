@@ -1489,21 +1489,35 @@ with tab2:
                      "판정": verdict + (f" · {'; '.join(notes)}" if notes else "")})
         points.append({"name": ph.name, "lat": lat, "lon": lon, "ok": ok, "city": city, "d": d_office})
 
-    if rows:
+if rows:
         st.markdown("#### 📏 사진별 확인 결과")
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-        n_ok = sum(1 for p_ in points if p_["ok"])
-        if trip_dest and n_ok:
-            far = max(p_["d"] for p_ in points if p_["ok"])
-            st.success(f"✅ 출장 이행 확인 — {base_name}에서 약 {far:.0f}km 떨어진 출장지({trip_dest})에서 촬영한 사진 {n_ok}장")
-        elif points and not trip_dest:
-            guess = max(points, key=lambda p_: p_["d"])["city"]
-            st.info(f"사진 위치로 보아 **{guess}** 인근을 다녀온 것으로 추정됩니다.")
-            if st.button(f"'{guess}'를 출장지로 지정"):
-                st.session_state.ocr_dest_city = guess
-                st.rerun()
-        elif points:
-            st.warning("출장지에서 찍은 사진이 확인되지 않았습니다. 서무 담당자 수기 확인이 필요합니다.")
+        
+        # 근무지 반경(office_r)을 벗어난 사진들만 모아서 분석
+        valid_points = [p_ for p_ in points if p_["d"] > office_r]
+        
+        if valid_points:
+            # 근무지에서 가장 멀리 떨어진 사진의 위치를 실제 방문지로 추정
+            best_point = max(valid_points, key=lambda p_: p_["d"])
+            guess = best_point["city"]
+            far = best_point["d"]
+            
+            if trip_dest == guess:
+                st.success(f"✅ 출장 이행 확인 — {base_name}에서 약 {far:.0f}km 떨어진 출장지({trip_dest}) 방문이 확인되었습니다.")
+            else:
+                msg = f"사진의 GPS 위치로 보아 **{guess}** 인근을 다녀온 것으로 추정됩니다."
+                if trip_dest:
+                    msg += f" (현재 설정된 출장지 '{trip_dest}'와 일치하지 않음)"
+                st.info(msg)
+                
+                # 사진에 찍힌 위치로 출장지 정보를 전부 덮어쓰는 강력한 버튼 제공
+                if st.button(f"사진 위치인 '{guess}'(으)로 출장지 자동 변경", type="primary"):
+                    st.session_state.ocr_dest_city = guess
+                    st.session_state.destination = guess
+                    st.session_state.dest_coord = DESTINATION_COORDS.get(guess)
+                    st.rerun()
+        else:
+            st.warning("출장지에서 찍은 사진이 확인되지 않습니다. (모두 근무지 근처 촬영이거나 위치 정보 없음)")
 
     if points:
         st.markdown("#### 🗺️ 이동 경로 지도")
