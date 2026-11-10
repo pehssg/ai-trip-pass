@@ -60,7 +60,7 @@ class LLMClient:
             r = requests.post(f"{self.base_url}/chat/completions",
                               json=body, headers=headers, timeout=self.timeout)
         except requests.RequestException as e:
-            raise LLMError(f"연결 실패: {e.__class__.__name__}") from e
+            raise LLMError(f"연결 실패: {e.__class__.__name__} (주소: {self.base_url})") from e
         if r.status_code != 200:
             raise LLMError(f"HTTP {r.status_code}: {r.text[:200]}")
         try:
@@ -78,7 +78,7 @@ class LLMClient:
         try:
             r = requests.get(f"{self.base_url}/models", headers=headers, timeout=20)
         except requests.RequestException as e:
-            raise LLMError(f"연결 실패: {e.__class__.__name__}") from e
+            raise LLMError(f"연결 실패: {e.__class__.__name__} (주소: {self.base_url})") from e
         if r.status_code != 200:
             raise LLMError(f"HTTP {r.status_code}: {r.text[:200]}")
         try:
@@ -86,9 +86,11 @@ class LLMClient:
         except ValueError as e:
             raise LLMError("모델 목록 형식이 OpenAI 호환 규격과 다릅니다.") from e
         ids = [str(m.get("id", "")).replace("models/", "", 1) for m in data if m.get("id")]
-        # 임베딩·이미지·음성 전용 모델은 대화에 쓸 수 없으므로 뒤로 보냄
-        skip = ("embed", "imagen", "veo", "tts", "aqa", "audio", "image")
-        return sorted(ids, key=lambda x: (any(k in x for k in skip), x))
+        # 임베딩·이미지·음성·실시간 전용 모델은 문장 답변에 쓸 수 없으므로 목록에서 뺌
+        skip = ("embed", "imagen", "veo", "tts", "aqa", "audio", "image", "live", "speech",
+                "transcribe", "computer-use", "robotics", "lyria")
+        text_ids = sorted(x for x in ids if not any(k in x.lower() for k in skip))
+        return text_ids or sorted(ids)
 
     def ping(self) -> tuple:
         """연결 테스트: (성공여부, 메시지)"""
