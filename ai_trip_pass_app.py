@@ -1068,7 +1068,6 @@ with tab1:
         )
 
         if receipt_file:
-            # getvalue(): 화면이 다시 그려질 때마다 파일 전체를 읽음(read()는 두 번째부터 빈 값이 될 수 있음)
             file_bytes = receipt_file.getvalue()
             result = None
             import hashlib
@@ -1089,7 +1088,6 @@ with tab1:
                             pass
                         result = parse_receipts(text=pdf_text, file_bytes=file_bytes)
                         if result.get("failed"):
-                            # 다른 추출기(pypdf)로 한 번 더 시도
                             try:
                                 from pypdf import PdfReader
                                 alt = "\n".join((pg.extract_text() or "") for pg in PdfReader(io.BytesIO(file_bytes)).pages)
@@ -1104,8 +1102,7 @@ with tab1:
                     _cache[_fkey] = (result, pdf_text)
 
                 if result.get("failed"):
-                    st.error("이 PDF에서 하이패스 영수증을 찾지 못했습니다. 한국도로공사 하이패스 영수증 PDF(텍스트 포함)인지 "
-                             "확인하세요. 통행료와 출장지는 아래에서 직접 입력할 수 있습니다.")
+                    st.error("이 PDF에서 하이패스 영수증을 찾지 못했습니다. 한국도로공사 하이패스 영수증 PDF(텍스트 포함)인지 확인하세요. 통행료와 출장지는 아래에서 직접 입력할 수 있습니다.")
                     with st.expander("PDF에서 읽은 글자 확인 (인식 개선용)"):
                         st.text(pdf_text[:800] if pdf_text.strip() else "읽을 수 있는 글자가 없습니다. 스캔(이미지)으로 만든 PDF일 수 있습니다.")
                 elif result.get("toll_fee", 0) > 0:
@@ -1116,7 +1113,6 @@ with tab1:
                 img = Image.open(io.BytesIO(file_bytes))
                 st.image(img, caption="업로드된 영수증", use_container_width=True)
                 st.warning("⚠️ 이미지 파일은 PDF로 변환 후 업로드하시면 더 정확하게 인식됩니다.")
-                # 이미지도 pdfplumber로 처리 불가 → 간단 정규식 파싱 시도
                 try:
                     import pytesseract
                     text = pytesseract.image_to_string(img, lang="kor+eng")
@@ -1140,12 +1136,12 @@ with tab1:
                     "is_total":    True,
                 }
 
-c1, c2 = st.columns(2)
+            c1, c2 = st.columns(2)
             with c1:
                 st.metric("출장일",      result["trip_date"])
                 st.metric("출발 요금소", result["origin_gate"])
             with c2:
-                # (수정 1) 편도/왕복 따지지 않고 무조건 영수증 합계를 표시합니다.
+                # 편도/왕복 따지지 않고 무조건 영수증 합계를 표시
                 st.metric("통행료 합계 (영수증 총액)", f"{result['toll_fee']:,}원")
                 st.metric("도착 요금소", result["dest_gate"])
 
@@ -1172,8 +1168,7 @@ c1, c2 = st.columns(2)
                 with st.expander("📝 AI 분석 원문"):
                     st.text(result["ocr_text"])
 
-            # ── 세션 저장: selectbox key에 직접 반영 ──
-            # (수정 2) 편도 * 2 곱하기 로직을 날리고 영수증 합산을 바로 저장합니다.
+            # ── 세션 저장 ──
             st.session_state.toll_fee = result["toll_fee"]
             st.session_state.trip_date = result["trip_date"]
             if not result.get("failed"):
@@ -1191,15 +1186,14 @@ c1, c2 = st.columns(2)
         st.markdown('<div class="card"><div class="card-title">② 출발지 · 목적지 설정</div>', unsafe_allow_html=True)
         cities = list(DISTANCE_FROM_SEOUL.keys())
 
-        # OCR 인식값 읽기
         ocr_origin = st.session_state.get("ocr_origin_city")
         ocr_dest   = st.session_state.get("ocr_dest_city")
 
-        # (수정 3) 출발지는 무조건 근무지(기관 기준점, 예: 음성)로 고정합니다.
+        # 출발지는 무조건 근무지(기관 기준점)로 고정
         _base = st.session_state.base_city if st.session_state.base_city in cities else cities[0]
         origin_default = cities.index(_base)
         
-        # (수정 4) 복귀 영수증 때문에 도착지가 음성(근무지)으로 찍힌 경우, 출발지로 찍혔던 곳을 실제 목적지로 덮어씁니다.
+        # 복귀 영수증 때문에 도착지가 근무지로 찍힌 경우, 출발지로 찍혔던 곳을 목적지로 덮어쓰기
         if ocr_dest == _base and ocr_origin and ocr_origin != _base:
             ocr_dest = ocr_origin
             
@@ -1208,11 +1202,11 @@ c1, c2 = st.columns(2)
         if ocr_origin or ocr_dest:
             st.caption(f"✅ 출발지는 근무지({_base})로 고정하고, 목적지는 영수증을 바탕으로 자동 설정했습니다.")
 
-        c1, c2 = st.columns(2)
-        with c1:
+        cf1, cf2 = st.columns(2)
+        with cf1:
             origin = st.selectbox("출발지", cities, index=origin_default,
                                   help="무조건 근무지(기관 소재지)가 출발지로 자동 선택됩니다. 필요 시 변경하세요.")
-        with c2:
+        with cf2:
             destination = st.selectbox("목적지(출장지)", cities, index=dest_default,
                                        placeholder="출장지를 고르세요")
 
@@ -1251,7 +1245,6 @@ c1, c2 = st.columns(2)
         st.session_state.fuel_type  = fuel_type
         st.session_state.car_model  = car_model
 
-        # 기준 유가: 오피넷 자동 갱신값 또는 기관 기준 유가(기관 설정 탭)
         ref_price, ref_label = get_reference_fuel_price(fuel_type)
         manual = st.number_input("적용 유가 (원/L)", min_value=500, max_value=3000,
                                  value=int(ref_price), step=10, key=f"fuel_{fuel_type}_{ref_price}",
@@ -1275,18 +1268,18 @@ c1, c2 = st.columns(2)
         st.session_state.fuel_cost  = fuel_cost
         st.session_state.total_cost = total_cost
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
+        cm1, cm2, cm3 = st.columns(3)
+        with cm1:
             st.markdown(f'<div class="metric-box"><div class="metric-label">유류비</div>'
                         f'<div class="metric-value" style="font-size:1.2rem">{fuel_cost:,.0f}원</div>'
                         f'<div style="font-size:.75rem;color:#888">{distance_km/efficiency:.1f}L 소비</div></div>',
                         unsafe_allow_html=True)
-        with c2:
+        with cm2:
             st.markdown(f'<div class="metric-box"><div class="metric-label">통행료 (왕복)</div>'
                         f'<div class="metric-value" style="font-size:1.2rem">{toll:,.0f}원</div>'
-                        f'<div style="font-size:.75rem;color:#888">편도 {toll//2:,}원 × 2</div></div>',
+                        f'<div style="font-size:.75rem;color:#888">영수증 합산</div></div>',
                         unsafe_allow_html=True)
-        with c3:
+        with cm3:
             st.markdown(f'<div class="metric-box"><div class="metric-label">왕복 거리</div>'
                         f'<div class="metric-value" style="font-size:1.2rem">{distance_km:.0f}km</div>'
                         f'<div style="font-size:.75rem;color:#888">편도 {distance_km/2:.0f}km</div></div>',
