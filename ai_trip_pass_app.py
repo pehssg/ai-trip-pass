@@ -610,8 +610,7 @@ def extract_pdf_receipts(file_bytes: bytes) -> list[str]:
                     # 영수증이 포함된 컬럼만 추가 (KEC 또는 영업소 포함 여부로 판단)
                     if re.search(r"영업소|KEC|통행료|\d종\s*\d", col_text):
                         # 컬럼 안에 여러 영수증이 있을 수 있으므로 블록 분리
-                        blocks = re.split(r"(?=하이패스는|영수증\n한국도로공사)", col_text)
-                        for block in blocks:
+blocks = re.split(r"(?=\d{4}년\d{2}월\d{2}일\s*\d{2}시\d{2}분|한국도로공사\s+\S+영업소|하이패스는)", col_text)                        for block in blocks:
                             if re.search(r"KEC|종\s*[\d,]+\s*원|영업소", block):
                                 receipt_texts.append(block.strip())
         return receipt_texts
