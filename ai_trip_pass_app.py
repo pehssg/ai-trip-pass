@@ -1140,13 +1140,13 @@ with tab1:
                     "is_total":    True,
                 }
 
-            c1, c2 = st.columns(2)
+c1, c2 = st.columns(2)
             with c1:
-                st.metric("출장일",     result["trip_date"])
+                st.metric("출장일",      result["trip_date"])
                 st.metric("출발 요금소", result["origin_gate"])
             with c2:
-                lbl = "통행료 합계" if result.get("is_total") else "통행료 (편도)"
-                st.metric(lbl, f"{result['toll_fee']:,}원")
+                # (수정 1) 편도/왕복 따지지 않고 무조건 영수증 합계를 표시합니다.
+                st.metric("통행료 합계 (영수증 총액)", f"{result['toll_fee']:,}원")
                 st.metric("도착 요금소", result["dest_gate"])
 
             if result.get("toll_detail"):
@@ -1159,30 +1159,30 @@ with tab1:
                             st.write(f"{i}. {name}  —  {int(amt):,}원  {time}")
 
             if result.get("origin_city") or result.get("dest_city"):
-                st.markdown("**🗺️ 출발지·목적지 자동 인식**")
+                st.markdown("**🗺️ 영수증 인식 지역**")
                 ca, cb = st.columns(2)
                 with ca:
                     if result.get("origin_city"):
-                        st.success(f"출발: **{result['origin_city']}**")
+                        st.success(f"출발 지역: **{result['origin_city']}**")
                 with cb:
                     if result.get("dest_city"):
-                        st.success(f"목적지: **{result['dest_city']}**")
+                        st.success(f"도착 지역: **{result['dest_city']}**")
 
             if result.get("ocr_text"):
                 with st.expander("📝 AI 분석 원문"):
                     st.text(result["ocr_text"])
 
             # ── 세션 저장: selectbox key에 직접 반영 ──
-            st.session_state.toll_fee  = result["toll_fee"] if result.get("is_total") else result["toll_fee"] * 2
+            # (수정 2) 편도 * 2 곱하기 로직을 날리고 영수증 합산을 바로 저장합니다.
+            st.session_state.toll_fee = result["toll_fee"]
             st.session_state.trip_date = result["trip_date"]
             if not result.get("failed"):
                 st.session_state.receipt_trip_date = result["trip_date"]
+                
             cities_tmp = list(DISTANCE_FROM_SEOUL.keys())
             if result.get("origin_city") and result["origin_city"] in cities_tmp:
-                st.session_state["sel_origin"] = result["origin_city"]
                 st.session_state["ocr_origin_city"] = result["origin_city"]
             if result.get("dest_city") and result["dest_city"] in cities_tmp:
-                st.session_state["sel_dest"] = result["dest_city"]
                 st.session_state["ocr_dest_city"] = result["dest_city"]
 
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1195,18 +1195,23 @@ with tab1:
         ocr_origin = st.session_state.get("ocr_origin_city")
         ocr_dest   = st.session_state.get("ocr_dest_city")
 
-        if ocr_origin or ocr_dest:
-            st.caption("✅ 영수증에서 자동 인식 — 필요 시 수정 가능합니다.")
-
-        # index 직접 계산 (key 방식 사용 안 함 → Streamlit rerun 없이도 반영)
+        # (수정 3) 출발지는 무조건 근무지(기관 기준점, 예: 음성)로 고정합니다.
         _base = st.session_state.base_city if st.session_state.base_city in cities else cities[0]
-        origin_default = cities.index(ocr_origin) if ocr_origin and ocr_origin in cities else cities.index(_base)
-        dest_default   = cities.index(ocr_dest)   if ocr_dest   and ocr_dest   in cities else None
+        origin_default = cities.index(_base)
+        
+        # (수정 4) 복귀 영수증 때문에 도착지가 음성(근무지)으로 찍힌 경우, 출발지로 찍혔던 곳을 실제 목적지로 덮어씁니다.
+        if ocr_dest == _base and ocr_origin and ocr_origin != _base:
+            ocr_dest = ocr_origin
+            
+        dest_default = cities.index(ocr_dest) if ocr_dest and ocr_dest in cities else None
+
+        if ocr_origin or ocr_dest:
+            st.caption(f"✅ 출발지는 근무지({_base})로 고정하고, 목적지는 영수증을 바탕으로 자동 설정했습니다.")
 
         c1, c2 = st.columns(2)
         with c1:
             origin = st.selectbox("출발지", cities, index=origin_default,
-                                  help="기본값은 '기관 설정'의 기관 소재지입니다.")
+                                  help="무조건 근무지(기관 소재지)가 출발지로 자동 선택됩니다. 필요 시 변경하세요.")
         with c2:
             destination = st.selectbox("목적지(출장지)", cities, index=dest_default,
                                        placeholder="출장지를 고르세요")
