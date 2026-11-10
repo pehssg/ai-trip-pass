@@ -66,8 +66,13 @@ def _init(k, v):
         st.session_state[k] = v
 
 _init("ocr_result", {})
-_init("destination", "수원")
-_init("dest_coord", (37.2636, 127.0286))
+_init("destination", None)
+_init("dest_coord", None)
+# 기관 소재지(기준점) — 기관 설정 탭에서 변경. 좌표 기본값은 음성군 중심 근사치
+_init("base_name", "국립원예특작과학원 인삼특작부")
+_init("base_city", "음성")
+_init("base_lat", 36.9398)
+_init("base_lon", 127.6902)
 _init("trip_distance", 0.0)
 _init("toll_fee", 0)
 _init("fuel_cost", 0.0)
@@ -109,7 +114,7 @@ if "_pending_settings" in st.session_state:
     _ps = st.session_state.pop("_pending_settings")
     for _k in ["llm_preset", "llm_base_url", "llm_model", "ref_fuel_gasoline", "ref_fuel_diesel",
                "ref_fuel_lpg", "road_factor", "radius_mode", "radius_fixed", "auto_approve_limit",
-               "disabled_docs"]:
+               "disabled_docs", "base_name", "base_city", "base_lat", "base_lon"]:
         if _k in _ps:
             st.session_state[_k] = _ps[_k]
     try:
@@ -697,6 +702,15 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
     # ── 시간순 정렬 ──────────────────────────────
     receipts.sort(key=lambda r: r["datetime"] or datetime.datetime.max)
 
+    if not receipts:
+        return {
+            "trip_date": datetime.date.today().strftime("%Y.%m.%d"), "toll_fee": 0, "toll_detail": [],
+            "origin_gate": "-", "dest_gate": "-", "origin_city": None, "dest_city": None,
+            "ocr_text": text[:300],
+            "method": "인식 실패 — 한국도로공사 하이패스 영수증 양식을 찾지 못했습니다",
+            "is_total": True, "failed": True,
+        }
+
     # ── 통행료 합계 ──────────────────────────────
     total_toll = sum(r["금액"] for r in receipts)
     # 총액 텍스트로 검증
@@ -1078,7 +1092,10 @@ with tab1:
                         pass
                     result = parse_receipts(text=pdf_text, file_bytes=file_bytes)
 
-                if result and result.get("toll_fee", 0) > 0:
+                if result.get("failed"):
+                    st.error("이 PDF에서 하이패스 영수증을 찾지 못했습니다. 한국도로공사 하이패스 영수증 PDF(텍스트 포함)인지 "
+                             "확인하세요. 스캔 이미지나 사용내역서 형식은 아직 지원하지 않습니다. 통행료와 출장지는 아래에서 직접 입력할 수 있습니다.")
+                elif result.get("toll_fee", 0) > 0:
                     st.success(f"✅ {result['method']} 완료")
                 else:
                     st.warning("⚠️ 일부 항목을 인식하지 못했습니다. 아래에서 직접 수정하세요.")
@@ -1167,28 +1184,37 @@ with tab1:
             st.caption("✅ 영수증에서 자동 인식 — 필요 시 수정 가능합니다.")
 
         # index 직접 계산 (key 방식 사용 안 함 → Streamlit rerun 없이도 반영)
-        origin_default = cities.index(ocr_origin) if ocr_origin and ocr_origin in cities else 0
-        dest_default   = cities.index(ocr_dest)   if ocr_dest   and ocr_dest   in cities else 1
+        _base = st.session_state.base_city if st.session_state.base_city in cities else cities[0]
+        origin_default = cities.index(ocr_origin) if ocr_origin and ocr_origin in cities else cities.index(_base)
+        dest_default   = cities.index(ocr_dest)   if ocr_dest   and ocr_dest   in cities else None
 
         c1, c2 = st.columns(2)
         with c1:
-            origin = st.selectbox("출발지", cities, index=origin_default)
+            origin = st.selectbox("출발지", cities, index=origin_default,
+                                  help="기본값은 '기관 설정'의 기관 소재지입니다.")
         with c2:
-            destination = st.selectbox("목적지", cities, index=dest_default)
+            destination = st.selectbox("목적지(출장지)", cities, index=dest_default,
+                                       placeholder="출장지를 고르세요")
 
         st.session_state.destination = destination
-        st.session_state.dest_coord  = DESTINATION_COORDS.get(destination, (37.5665,126.9780))
+        st.session_state.dest_coord  = DESTINATION_COORDS.get(destination) if destination else None
         _factor = float(st.session_state.road_factor)
-        auto_km = estimate_one_way_km(origin, destination, _factor)
-        one_way_km = st.number_input(
-            "편도 거리 (km)", min_value=0.0, max_value=1000.0, value=float(auto_km), step=1.0,
-            key=f"km_{origin}_{destination}_{_factor}",
-            help="두 지역 좌표의 직선거리에 도로계수를 곱해 추정합니다. 실제 경로와 다르면 수정하세요.")
-        distance_km = round(one_way_km * 2, 1)
-        st.session_state.trip_distance = distance_km
-        st.session_state.route_text = f"{origin} → {destination} : {one_way_km:.1f}km"
-        _edited = "출장자 수정" if abs(one_way_km - auto_km) > 0.05 else f"자동 추정(직선거리 × {_factor})"
-        st.info(f"📏 왕복 이동거리: **{distance_km} km** (편도 {one_way_km:.1f} km · {_edited})")
+        if destination:
+            auto_km = estimate_one_way_km(origin, destination, _factor)
+            one_way_km = st.number_input(
+                "편도 거리 (km)", min_value=0.0, max_value=1000.0, value=float(auto_km), step=1.0,
+                key=f"km_{origin}_{destination}_{_factor}",
+                help="두 지역 좌표의 직선거리에 도로계수를 곱해 추정합니다. 실제 경로와 다르면 수정하세요.")
+            distance_km = round(one_way_km * 2, 1)
+            st.session_state.trip_distance = distance_km
+            st.session_state.route_text = f"{origin} → {destination} : {one_way_km:.1f}km"
+            _edited = "출장자 수정" if abs(one_way_km - auto_km) > 0.05 else f"자동 추정(직선거리 × {_factor})"
+            st.info(f"📏 왕복 이동거리: **{distance_km} km** (편도 {one_way_km:.1f} km · {_edited})")
+        else:
+            distance_km = 0.0
+            st.session_state.trip_distance = 0.0
+            st.session_state.route_text = ""
+            st.info("출장지를 고르거나 영수증을 올리면 이동거리를 계산합니다.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col_right:
@@ -1269,7 +1295,8 @@ with tab1:
                                         value=st.session_state.trip_date or datetime.date.today().strftime("%Y.%m.%d"))
         st.session_state.trip_date = trip_date_input
 
-        if st.button("📄 PDF 자동 생성 & 다운로드", use_container_width=True, type="primary"):
+        if st.button("📄 PDF 자동 생성 & 다운로드", use_container_width=True, type="primary",
+                     disabled=not st.session_state.destination):
             with st.spinner("PDF 생성 중..."):
                 pdf_bytes = generate_trip_pdf(
                     trip_date   = st.session_state.trip_date,
@@ -1307,9 +1334,24 @@ with tab1:
 # ──────────────────────────────────────────────
 with tab2:
     st.markdown('<div class="card"><div class="card-title">📸 현장 사진 EXIF 위치 증빙</div>', unsafe_allow_html=True)
-    dest_name  = st.session_state.destination
-    dest_coord = st.session_state.dest_coord
-    st.info(f"🗺️ Tab 1 목적지: **{dest_name}** ({dest_coord[0]:.4f}, {dest_coord[1]:.4f})")
+    _cities = list(DISTANCE_FROM_SEOUL.keys())
+    _ref_opts = [f"기관 소재지 ({st.session_state.base_name})", "출장지 (영수증 처리 탭에서 정한 곳)", "다른 시·군 직접 선택"]
+    ref_choice = st.radio("위치 검증 기준점", _ref_opts, index=1 if st.session_state.destination else 0,
+                          horizontal=True,
+                          help="출장지를 정하면 출장지가 기본 기준점이 됩니다. 기관 소재지는 '기관 설정'에서 바꿉니다.")
+    if ref_choice == _ref_opts[1] and st.session_state.destination:
+        dest_name, ref_city = st.session_state.destination, st.session_state.destination
+        dest_coord = st.session_state.dest_coord
+    elif ref_choice == _ref_opts[2]:
+        ref_city = st.selectbox("기준 시·군", _cities,
+                                index=_cities.index(st.session_state.base_city) if st.session_state.base_city in _cities else 0)
+        dest_name, dest_coord = ref_city, DESTINATION_COORDS[ref_city]
+    else:
+        if ref_choice == _ref_opts[1]:
+            st.warning("출장지가 아직 정해지지 않아 기관 소재지를 기준으로 합니다.")
+        dest_name, ref_city = st.session_state.base_name, st.session_state.base_city
+        dest_coord = (float(st.session_state.base_lat), float(st.session_state.base_lon))
+    st.info(f"🗺️ 기준점: **{dest_name}** ({dest_coord[0]:.4f}, {dest_coord[1]:.4f}) · 허용 반경 {verify_radius(ref_city):.0f}km")
 
     photo_file = st.file_uploader("현장 사진 (GPS EXIF 포함 JPG 권장)",
                                   type=["jpg","jpeg"], key="photo_uploader")
@@ -1327,18 +1369,14 @@ with tab2:
                             f'촬영 시각: <code>{gps_data["datetime"] or "없음"}</code></div>',
                             unsafe_allow_html=True)
             else:
-                st.warning("⚠️ GPS 정보 없음 — 시연용 좌표 사용")
-                gps_data = {
-                    "lat": dest_coord[0] + np.random.uniform(-0.03, 0.03),
-                    "lon": dest_coord[1] + np.random.uniform(-0.03, 0.03),
-                    "datetime": datetime.datetime.now().strftime("%Y:%m:%d %H:%M:%S"),
-                }
-                st.info(f"시연 좌표: ({gps_data['lat']:.4f}, {gps_data['lon']:.4f})")
+                st.warning("⚠️ 이 사진에는 위치정보가 없어 자동 검증할 수 없습니다. 수기 확인이 필요합니다. "
+                           "(촬영 시 카메라의 위치 태그를 켜 주세요)")
+                gps_data = None
 
     with col_result:
         if photo_file and gps_data:
             dist_km = haversine(dest_coord[0], dest_coord[1], gps_data["lat"], gps_data["lon"])
-            radius  = verify_radius(dest_name)
+            radius  = verify_radius(ref_city)
 
             st.markdown("#### 📏 위치 검증 결과")
             m1, m2 = st.columns(2)
@@ -1358,7 +1396,7 @@ with tab2:
                 )
 
     # 지도 섹션에서 radius/dist_km 사용 — 기본값 먼저 초기화
-    radius  = verify_radius(dest_name)
+    radius  = verify_radius(ref_city)
     dist_km = 0.0
     if photo_file and gps_data:
         dist_km = haversine(dest_coord[0], dest_coord[1], gps_data["lat"], gps_data["lon"])
@@ -1475,9 +1513,15 @@ def _apply_preset():
         st.session_state.llm_model = p.get("model", "")
 
 
+def _fill_base_coord():
+    c = DESTINATION_COORDS.get(st.session_state.base_city)
+    if c:
+        st.session_state.base_lat, st.session_state.base_lon = c
+
+
 SETTING_KEYS = ["llm_preset", "llm_base_url", "llm_model", "ref_fuel_gasoline", "ref_fuel_diesel",
                 "ref_fuel_lpg", "road_factor", "radius_mode", "radius_fixed", "auto_approve_limit",
-                "disabled_docs"]
+                "disabled_docs", "base_name", "base_city", "base_lat", "base_lon"]
 
 with tab4:
     st.caption("기관마다 다른 기준을 여기서 정합니다. 설정은 파일로 내보내고 다시 불러올 수 있습니다(API 키는 내보내지 않음).")
@@ -1497,6 +1541,17 @@ with tab4:
             (st.success if ok else st.error)(msg)
         st.caption("OpenAI 호환 규격이면 주소와 모델명만 바꿔 다른 모델로 교체됩니다. "
                    "연결하지 않아도 서무비서는 규정 검색으로 절차와 근거를 안내합니다.")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── 기관 소재지(기준점) ─────────────────
+        st.markdown('<div class="card"><div class="card-title">기관 소재지 (기준점)</div>', unsafe_allow_html=True)
+        st.text_input("기관명", key="base_name")
+        st.selectbox("소재 시·군", list(DISTANCE_FROM_SEOUL.keys()), key="base_city", on_change=_fill_base_coord,
+                     help="출발지 기본값과 위치 검증 기준점에 쓰입니다. 바꾸면 좌표가 해당 시·군 중심으로 채워집니다.")
+        b1, b2 = st.columns(2)
+        b1.number_input("위도", -90.0, 90.0, step=0.0001, format="%.6f", key="base_lat")
+        b2.number_input("경도", -180.0, 180.0, step=0.0001, format="%.6f", key="base_lon")
+        st.caption("기본 좌표는 음성군 중심 근사치입니다. 지도 앱에서 기관 건물 위치의 좌표를 확인해 입력하면 정확해집니다.")
         st.markdown('</div>', unsafe_allow_html=True)
 
         # ── 산정·검증 기준 ─────────────────────
