@@ -1080,6 +1080,27 @@ def active_rule_docs() -> list:
     return [d for d in docs if d.name not in st.session_state.disabled_docs]
 
 
+def render_vehicle_fuel(prefix: str, fuel_day: str) -> dict:
+    """차종·유종·적용 유가 선택 화면(영수증 처리 탭과 현장사진 탭에서 같은 화면을 씀)."""
+    cars = list(VEHICLE_FUEL_EFFICIENCY.keys())
+    car_model = st.selectbox("차종 선택", cars, key=f"{prefix}_car",
+                             index=cars.index(st.session_state.get("car_model")) if st.session_state.get("car_model") in cars else 0,
+                             help="브랜드별로 정렬되어 있습니다. 해당 차량이 없으면 유사 차종을 선택하세요.")
+    efficiency = VEHICLE_FUEL_EFFICIENCY[car_model]
+    st.caption(f"🚘 공인 평균 연비: **{efficiency} km/L**  |  총 {len(cars)}개 차종 등록")
+    fuels = ["휘발유", "경유", "LPG"]
+    fuel_type = st.selectbox("유종 선택", fuels, key=f"{prefix}_fuel",
+                             index=fuels.index(st.session_state.get("fuel_type")) if st.session_state.get("fuel_type") in fuels else 0)
+    ref_price, ref_label = get_fuel_price_for_date(fuel_type, fuel_day)
+    price = st.number_input("적용 유가 (원/L)", min_value=500, max_value=3000, value=int(ref_price), step=10,
+                            key=f"{prefix}_price_{fuel_type}_{ref_price}",
+                            help="출장일 기준 유가가 자동으로 들어갑니다. 다르면 수정하세요.")
+    label = ref_label if price == ref_price else f"출장자 수정값 (기준 {ref_price:,}원/L)"
+    st.caption(f"기준: {label}")
+    return {"car_model": car_model, "efficiency": efficiency, "fuel_type": fuel_type,
+            "price": int(price), "label": label}
+
+
 def run_assistant(query: str) -> dict:
     docs = active_rule_docs()
     articles = [a for d in docs for a in d.articles]
@@ -1348,25 +1369,13 @@ with tab1:
     with col_right:
         # ③ 차량·유류비
         st.markdown('<div class="card"><div class="card-title">③ 차량 & 유류비 설정</div>', unsafe_allow_html=True)
-        car_model  = st.selectbox(
-            "차종 선택",
-            list(VEHICLE_FUEL_EFFICIENCY.keys()),
-            help="브랜드별로 정렬되어 있습니다. 해당 차량이 없으면 유사 차종을 선택하세요.",
-        )
-        efficiency = VEHICLE_FUEL_EFFICIENCY[car_model]
-        st.caption(f"🚘 공인 평균 연비: **{efficiency} km/L**  |  총 {len(VEHICLE_FUEL_EFFICIENCY)}개 차종 등록")
-        fuel_type  = st.selectbox("유종 선택", ["휘발유","경유","LPG"])
-        st.session_state.fuel_type  = fuel_type
-        st.session_state.car_model  = car_model
-
         _fuel_day = st.session_state.get("receipt_trip_date") or st.session_state.get("trip_date") or ""
-        ref_price, ref_label = get_fuel_price_for_date(fuel_type, _fuel_day)
-        manual = st.number_input("적용 유가 (원/L)", min_value=500, max_value=3000,
-                                 value=int(ref_price), step=10, key=f"fuel_{fuel_type}_{ref_price}",
-                                 help="기준 유가가 자동으로 들어갑니다. 출장일 유가가 다르면 수정하세요.")
-        st.session_state.fuel_price = manual
-        st.session_state.fuel_source = ref_label if manual == ref_price else f"출장자 수정값 (기준 {ref_price:,}원/L)"
-        st.caption(f"기준: {st.session_state.fuel_source}")
+        _vf = render_vehicle_fuel("t1", _fuel_day)
+        car_model, efficiency, fuel_type = _vf["car_model"], _vf["efficiency"], _vf["fuel_type"]
+        st.session_state.car_model = car_model
+        st.session_state.fuel_type = fuel_type
+        st.session_state.fuel_price = _vf["price"]
+        st.session_state.fuel_source = _vf["label"]
 
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1521,7 +1530,7 @@ with tab2:
                      "촬영 지역": city, "기관에서 거리": f"{d_office:.1f} km",
                      "출장지에서 거리": f"{d_trip:.1f} km" if d_trip is not None else "-",
                      "판정": verdict + (f" · {'; '.join(notes)}" if notes else "")})
-        points.append({"name": ph.name, "lat": lat, "lon": lon, "ok": ok, "city": city, "d": d_office})
+        points.append({"name": ph.name, "lat": lat, "lon": lon, "ok": ok, "city": city, "d": d_office, "shot": shot})
 
     if rows:
         st.markdown("#### 📏 사진별 확인 결과")
@@ -1575,6 +1584,62 @@ with tab2:
                             dash_array="8", opacity=0.7, tooltip=f"기관에서 {p_['d']:.0f}km").add_to(m)
         m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(30, 30))
         st_folium(m, width=None, height=440, returned_objects=[])
+
+    # ── 사진 위치 기준 유류비 산정 ─────────────────────────
+    st.markdown("#### 🚗 사진 위치 기준 유류비 산정")
+    _far_pts = [p_ for p_ in points if p_["d"] > office_r]
+    if not _far_pts:
+        st.info("출장지에서 찍은 위치정보 사진을 올리면, 기관 소재지에서 촬영지까지의 거리로 유류비를 계산합니다.")
+    else:
+        _ok_pts = [p_ for p_ in _far_pts if p_["ok"]]
+        basis = max(_ok_pts or _far_pts, key=lambda p_: p_["d"])
+        if not _ok_pts:
+            st.warning("출장 이행이 확인된 사진이 없어, 가장 먼 촬영지를 기준으로 계산합니다. 수기 확인 후 지급하세요.")
+        c_l, c_r = st.columns(2, gap="large")
+        with c_l:
+            _factor = float(st.session_state.road_factor)
+            auto_km = round(basis["d"] * _factor, 1)
+            one_way = st.number_input("편도 거리 (km)", min_value=0.0, max_value=1000.0, value=float(auto_km), step=1.0,
+                                      key=f"t2_km_{basis['name']}_{_factor}",
+                                      help="기관 소재지에서 촬영지까지 직선거리 × 도로계수로 추정합니다. 실제 경로와 다르면 수정하세요.")
+            round_km = round(one_way * 2, 1)
+            st.caption(f"경로: {base_name} → {basis['city']} 인근(촬영지) · 왕복 {round_km} km")
+            toll2 = st.number_input("통행료 (원)", min_value=0, value=int(st.session_state.toll_fee or 0), step=100,
+                                    key="t2_toll", help="영수증 처리 탭에서 인식한 통행료가 자동으로 들어갑니다. 없으면 0원.")
+        with c_r:
+            _day2 = basis.get("shot") or st.session_state.get("receipt_trip_date") or ""
+            vf2 = render_vehicle_fuel("t2", _day2)
+        liters = round_km / vf2["efficiency"] if vf2["efficiency"] else 0
+        fuel2 = liters * vf2["price"]
+        total2 = fuel2 + toll2
+        m1, m2, m3 = st.columns(3)
+        m1.metric("유류비", f"{fuel2:,.0f}원", f"{liters:.1f}L 소비", delta_color="off")
+        m2.metric("통행료", f"{toll2:,.0f}원")
+        m3.metric("왕복 거리", f"{round_km:.0f}km")
+        st.markdown(f"""
+        <div class="final-amount">
+          <div class="label">💰 사진 기준 청구 금액 (유류비 + 통행료)</div>
+          <div class="amount">{total2:,.0f} 원</div>
+          <div style="color:#388e3c;font-size:.75rem;margin-top:4px">
+            ({round_km}km ÷ {vf2['efficiency']}km/L × {vf2['price']:,}원/L) + 통행료 {toll2:,.0f}원
+          </div>
+        </div>""", unsafe_allow_html=True)
+        if st.button("📄 이 금액으로 출장이행확인서 PDF 생성", key="t2_pdf", use_container_width=True):
+            _date_txt = (_day2 or datetime.date.today().isoformat()).replace("-", ".")
+            pdf2 = generate_trip_pdf(
+                trip_date=_date_txt, destination=trip_dest or basis["city"],
+                route_text=f"{st.session_state.base_city} → {basis['city']} : {one_way:.1f}km (사진 위치 기준)",
+                distance=round_km, car_model=vf2["car_model"], fuel_type=vf2["fuel_type"],
+                fuel_price=vf2["price"], toll_fee=int(toll2), total_cost=total2, fuel_source=vf2["label"])
+            st.download_button("⬇️ PDF 다운로드", data=pdf2, use_container_width=True, mime="application/pdf",
+                               file_name=f"출장이행확인서_사진기준_{_date_txt.replace('.', '')}.pdf")
+            st.session_state.submitted_trips.append({
+                "제출일": datetime.date.today().strftime("%Y-%m-%d"), "출장일": _date_txt,
+                "출장지": trip_dest or basis["city"], "이동거리(km)": round_km, "차종": vf2["car_model"],
+                "유류비(원)": round(fuel2), "통행료(원)": int(toll2), "청구금액(원)": round(total2),
+                "상태": "자동 승인 (Pass)" if (_ok_pts and total2 < st.session_state.auto_approve_limit)
+                        else "수기 확인 필요 (Alert)",
+            })
 
     st.caption(f"판정 기준: 기관 소재지 {office_r:.0f}km 안에서 찍은 사진은 출장 증빙으로 보지 않음 · "
                "출장지 허용 반경과 출발 기준 좌표는 '기관 설정'에서 바꿀 수 있음")
