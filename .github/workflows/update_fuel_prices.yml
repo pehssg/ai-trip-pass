@@ -25,7 +25,7 @@ jobs:
       - name: 오피넷 유가 수집
         env:
           OPINET_API_KEY: ${{ secrets.OPINET_API_KEY }}
-        run: python scripts/scrape_fuel_prices.py
+        run: python scrape_fuel_prices.py
       - name: 변경사항 커밋 & 푸시
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
