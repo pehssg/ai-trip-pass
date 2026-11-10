@@ -759,13 +759,18 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
                 return c
         return None
 
-    origin_city = find_city(origin_gate)
+origin_city = find_city(origin_gate)
     dest_city   = find_city(dest_gate)
 
     last = receipts[-1] if receipts else {}
 
-    # (수정 반영: 정상적인 위치로 이동됨) 영수증 2건 이상이거나 총액 텍스트가 있으면 왕복으로 처리
-    is_total = len(receipts) >= 2 or bool(total_m)
+    # 영수증이 정확히 1장 뿐이면 편도(False)로 처리하여 나중에 2배가 되도록 함
+    if len(receipts) == 1:
+        is_total = False
+    else:
+        # 영수증이 2장 이상이거나, 텍스트에 '총 2건 이상' 문구가 있으면 왕복(True)
+        total_count_m = re.search(r"총\s*([2-9]|\d{2,})\s*건", text)
+        is_total = len(receipts) >= 2 or bool(total_count_m)
 
     return {
         "trip_date":   trip_date,
