@@ -71,8 +71,8 @@ _init("dest_coord", None)
 # 기관 소재지(기준점) — 기관 설정 탭에서 변경. 좌표 기본값은 음성군 중심 근사치
 _init("base_name", "국립원예특작과학원 인삼특작부")
 _init("base_city", "음성")
-_init("base_lat", 36.9398)
-_init("base_lon", 127.6902)
+_init("base_lat", 36.8837)
+_init("base_lon", 127.7335)
 _init("trip_distance", 0.0)
 _init("toll_fee", 0)
 _init("fuel_cost", 0.0)
@@ -702,13 +702,20 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
     receipts.sort(key=lambda r: r["datetime"] or datetime.datetime.max)
 
     if not receipts:
-        return {
-            "trip_date": datetime.date.today().strftime("%Y.%m.%d"), "toll_fee": 0, "toll_detail": [],
-            "origin_gate": "-", "dest_gate": "-", "origin_city": None, "dest_city": None,
-            "ocr_text": text[:300],
-            "method": "인식 실패 — 한국도로공사 하이패스 영수증 양식을 찾지 못했습니다",
-            "is_total": True, "failed": True,
-        }
+is_total = len(receipts) >= 2 or bool(total_m)
+
+return {
+    "trip_date":   trip_date,
+    "toll_fee":    total_toll,
+    "toll_detail": receipts,
+    "origin_gate": origin_gate,
+    "dest_gate":   dest_gate,
+    "origin_city": origin_city,
+    "dest_city":   dest_city,
+    "ocr_text":    f"영수증 {len(receipts)}건 인식 | 출발: {origin_gate}({first.get('시각','')}) → 도착: {dest_gate}({last.get('시각','')})",
+    "method":      f"pdfplumber 컬럼 분리 파싱 (무료) — {len(receipts)}건",
+    "is_total":    is_total,
+}
 
     # ── 통행료 합계 ──────────────────────────────
     total_toll = sum(r["금액"] for r in receipts)
