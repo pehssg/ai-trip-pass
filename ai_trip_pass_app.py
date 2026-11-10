@@ -1078,23 +1078,46 @@ with tab1:
         )
 
         if receipt_file:
-            file_bytes = receipt_file.read()
+            # getvalue(): 화면이 다시 그려질 때마다 파일 전체를 읽음(read()는 두 번째부터 빈 값이 될 수 있음)
+            file_bytes = receipt_file.getvalue()
             result = None
+            import hashlib
+            _fkey = hashlib.md5(file_bytes).hexdigest()
+            _cache = st.session_state.setdefault("_receipt_cache", {})
 
-            if receipt_file.type == "application/pdf":
-                with st.spinner("📄 PDF 분석 중 (컬럼 분리 파싱)..."):
-                    pdf_text = ""
-                    try:
-                        import pdfplumber
-                        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                            pdf_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-                    except Exception:
-                        pass
-                    result = parse_receipts(text=pdf_text, file_bytes=file_bytes)
+            if receipt_file.name.lower().endswith(".pdf") or receipt_file.type == "application/pdf":
+                if _fkey in _cache:
+                    result, pdf_text = _cache[_fkey]
+                else:
+                    with st.spinner("📄 PDF 분석 중..."):
+                        pdf_text = ""
+                        try:
+                            import pdfplumber
+                            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                                pdf_text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+                        except Exception:
+                            pass
+                        result = parse_receipts(text=pdf_text, file_bytes=file_bytes)
+                        if result.get("failed"):
+                            # 다른 추출기(pypdf)로 한 번 더 시도
+                            try:
+                                from pypdf import PdfReader
+                                alt = "\n".join((pg.extract_text() or "") for pg in PdfReader(io.BytesIO(file_bytes)).pages)
+                                if alt.strip():
+                                    alt_res = parse_receipts(text=alt, file_bytes=None)
+                                    if not alt_res.get("failed"):
+                                        result, pdf_text = alt_res, alt
+                                    elif not pdf_text.strip():
+                                        pdf_text = alt
+                            except Exception:
+                                pass
+                    _cache[_fkey] = (result, pdf_text)
 
                 if result.get("failed"):
                     st.error("이 PDF에서 하이패스 영수증을 찾지 못했습니다. 한국도로공사 하이패스 영수증 PDF(텍스트 포함)인지 "
-                             "확인하세요. 스캔 이미지나 사용내역서 형식은 아직 지원하지 않습니다. 통행료와 출장지는 아래에서 직접 입력할 수 있습니다.")
+                             "확인하세요. 통행료와 출장지는 아래에서 직접 입력할 수 있습니다.")
+                    with st.expander("PDF에서 읽은 글자 확인 (인식 개선용)"):
+                        st.text(pdf_text[:800] if pdf_text.strip() else "읽을 수 있는 글자가 없습니다. 스캔(이미지)으로 만든 PDF일 수 있습니다.")
                 elif result.get("toll_fee", 0) > 0:
                     st.success(f"✅ {result['method']} 완료")
                 else:
@@ -1162,6 +1185,8 @@ with tab1:
             # ── 세션 저장: selectbox key에 직접 반영 ──
             st.session_state.toll_fee  = result["toll_fee"] if result.get("is_total") else result["toll_fee"] * 2
             st.session_state.trip_date = result["trip_date"]
+            if not result.get("failed"):
+                st.session_state.receipt_trip_date = result["trip_date"]
             cities_tmp = list(DISTANCE_FROM_SEOUL.keys())
             if result.get("origin_city") and result["origin_city"] in cities_tmp:
                 st.session_state["sel_origin"] = result["origin_city"]
@@ -1333,92 +1358,102 @@ with tab1:
 # TAB 2
 # ──────────────────────────────────────────────
 with tab2:
-    st.markdown('<div class="card"><div class="card-title">📸 현장 사진 EXIF 위치 증빙</div>', unsafe_allow_html=True)
-    _cities = list(DISTANCE_FROM_SEOUL.keys())
-    _ref_opts = [f"기관 소재지 ({st.session_state.base_name})", "출장지 (영수증 처리 탭에서 정한 곳)", "다른 시·군 직접 선택"]
-    ref_choice = st.radio("위치 검증 기준점", _ref_opts, index=1 if st.session_state.destination else 0,
-                          horizontal=True,
-                          help="출장지를 정하면 출장지가 기본 기준점이 됩니다. 기관 소재지는 '기관 설정'에서 바꿉니다.")
-    if ref_choice == _ref_opts[1] and st.session_state.destination:
-        dest_name, ref_city = st.session_state.destination, st.session_state.destination
-        dest_coord = st.session_state.dest_coord
-    elif ref_choice == _ref_opts[2]:
-        ref_city = st.selectbox("기준 시·군", _cities,
-                                index=_cities.index(st.session_state.base_city) if st.session_state.base_city in _cities else 0)
-        dest_name, dest_coord = ref_city, DESTINATION_COORDS[ref_city]
+    st.markdown('<div class="card"><div class="card-title">📸 현장사진으로 출장 이행 증빙</div>', unsafe_allow_html=True)
+    st.write("출장지에서 찍은 사진의 위치정보로, 기관 소재지에서 출장지까지 다녀왔는지 확인합니다.")
+
+    base_name  = st.session_state.base_name
+    base_coord = (float(st.session_state.base_lat), float(st.session_state.base_lon))
+    trip_dest  = st.session_state.destination
+    trip_coord = st.session_state.dest_coord
+    trip_date  = (st.session_state.get("receipt_trip_date") or "").replace(".", "-")   # 영수증으로 확인된 출장일
+    office_r   = 3.0   # 기관 소재지 반경(km): 이 안에서 찍은 사진은 출장 증빙으로 보지 않음
+
+    i1, i2 = st.columns(2)
+    i1.info(f"🏢 출발 기준: **{base_name}**")
+    if trip_dest:
+        i2.info(f"📍 출장지: **{trip_dest}** · 허용 반경 {verify_radius(trip_dest):.0f}km")
     else:
-        if ref_choice == _ref_opts[1]:
-            st.warning("출장지가 아직 정해지지 않아 기관 소재지를 기준으로 합니다.")
-        dest_name, ref_city = st.session_state.base_name, st.session_state.base_city
-        dest_coord = (float(st.session_state.base_lat), float(st.session_state.base_lon))
-    st.info(f"🗺️ 기준점: **{dest_name}** ({dest_coord[0]:.4f}, {dest_coord[1]:.4f}) · 허용 반경 {verify_radius(ref_city):.0f}km")
+        i2.warning("출장지가 아직 정해지지 않았습니다. 사진 위치로 촬영 지역을 추정해 보여 줍니다.")
 
-    photo_file = st.file_uploader("현장 사진 (GPS EXIF 포함 JPG 권장)",
-                                  type=["jpg","jpeg"], key="photo_uploader")
+    photos = st.file_uploader("현장사진 (위치정보 포함 JPG, 여러 장 가능)", type=["jpg", "jpeg"],
+                              accept_multiple_files=True, key="photo_uploader")
 
-    col_photo, col_result = st.columns([1,1], gap="large")
-    with col_photo:
-        if photo_file:
-            photo = Image.open(photo_file)
-            st.image(photo, caption="업로드된 현장 사진", use_container_width=True)
-            gps_data = extract_exif_gps(photo)
-            if gps_data:
-                st.markdown(f'<div class="card"><b>📡 EXIF 추출 결과</b><br><br>'
-                            f'위도: <code>{gps_data["lat"]:.6f}</code><br>'
-                            f'경도: <code>{gps_data["lon"]:.6f}</code><br>'
-                            f'촬영 시각: <code>{gps_data["datetime"] or "없음"}</code></div>',
-                            unsafe_allow_html=True)
-            else:
-                st.warning("⚠️ 이 사진에는 위치정보가 없어 자동 검증할 수 없습니다. 수기 확인이 필요합니다. "
-                           "(촬영 시 카메라의 위치 태그를 켜 주세요)")
-                gps_data = None
+    def nearest_city(lat, lon):
+        return min(DESTINATION_COORDS.items(), key=lambda kv: haversine(lat, lon, kv[1][0], kv[1][1]))[0]
 
-    with col_result:
-        if photo_file and gps_data:
-            dist_km = haversine(dest_coord[0], dest_coord[1], gps_data["lat"], gps_data["lon"])
-            radius  = verify_radius(ref_city)
+    rows, points = [], []
+    for ph in photos or []:
+        try:
+            img = Image.open(io.BytesIO(ph.getvalue()))
+        except Exception:
+            rows.append({"사진": ph.name, "판정": "⚠️ 이미지를 열 수 없음"}); continue
+        g_ = extract_exif_gps(img)
+        if not g_:
+            rows.append({"사진": ph.name, "촬영 시각": "-", "촬영 지역": "-", "기관에서 거리": "-",
+                         "출장지에서 거리": "-", "판정": "⚠️ 위치정보 없음 · 수기 확인"})
+            continue
+        lat, lon = g_["lat"], g_["lon"]
+        city = nearest_city(lat, lon)
+        d_office = haversine(base_coord[0], base_coord[1], lat, lon)
+        d_trip = haversine(trip_coord[0], trip_coord[1], lat, lon) if trip_coord else None
+        shot = (g_.get("datetime") or "")[:10].replace(":", "-")
+        notes = []
+        if d_office <= office_r:
+            verdict, ok = "⚠️ 기관 소재지에서 촬영 · 출장 증빙 아님", False
+        elif d_trip is not None and d_trip <= verify_radius(trip_dest):
+            verdict, ok = f"✅ 출장지({trip_dest}) 방문 확인", True
+        elif d_trip is not None:
+            verdict, ok = f"⚠️ 출장지와 다른 곳({city} 인근) · 수기 확인", False
+        else:
+            verdict, ok = f"📍 {city} 인근 방문 추정 · 출장지 지정 필요", None
+        if shot and trip_date and shot != trip_date:
+            notes.append(f"촬영일 {shot} ≠ 출장일 {trip_date}")
+            if ok:
+                verdict, ok = verdict + " (촬영일 확인 필요)", False
+        rows.append({"사진": ph.name, "촬영 시각": (g_.get("datetime") or "-").replace(":", "-", 2),
+                     "촬영 지역": city, "기관에서 거리": f"{d_office:.1f} km",
+                     "출장지에서 거리": f"{d_trip:.1f} km" if d_trip is not None else "-",
+                     "판정": verdict + (f" · {'; '.join(notes)}" if notes else "")})
+        points.append({"name": ph.name, "lat": lat, "lon": lon, "ok": ok, "city": city, "d": d_office})
 
-            st.markdown("#### 📏 위치 검증 결과")
-            m1, m2 = st.columns(2)
-            with m1: st.metric("목적지 좌표", f"{dest_coord[0]:.3f}, {dest_coord[1]:.3f}")
-            with m2: st.metric("사진 좌표",   f"{gps_data['lat']:.3f}, {gps_data['lon']:.3f}")
-            st.metric("두 지점 간 거리", f"{dist_km:.2f} km",
-                      delta=f"허용 반경: {radius:.0f}km ({dest_name} 기준)")
-            if dist_km <= radius:
-                st.success(
-                    f"✅ 정상 증빙 — {dest_name} 내 {dist_km:.2f}km 지점 "
-                    f"(허용 반경 {radius:.0f}km 이내)"
-                )
-            else:
-                st.warning(
-                    f"⚠️ 위치 불일치 — {dest_name} 중심에서 {dist_km:.2f}km "
-                    f"(허용 반경 {radius:.0f}km 초과) · 수기 확인 필요"
-                )
+    if rows:
+        st.markdown("#### 📏 사진별 확인 결과")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        n_ok = sum(1 for p_ in points if p_["ok"])
+        if trip_dest and n_ok:
+            far = max(p_["d"] for p_ in points if p_["ok"])
+            st.success(f"✅ 출장 이행 확인 — {base_name}에서 약 {far:.0f}km 떨어진 출장지({trip_dest})에서 촬영한 사진 {n_ok}장")
+        elif points and not trip_dest:
+            guess = max(points, key=lambda p_: p_["d"])["city"]
+            st.info(f"사진 위치로 보아 **{guess}** 인근을 다녀온 것으로 추정됩니다.")
+            if st.button(f"'{guess}'를 출장지로 지정"):
+                st.session_state.ocr_dest_city = guess
+                st.rerun()
+        elif points:
+            st.warning("출장지에서 찍은 사진이 확인되지 않았습니다. 서무 담당자 수기 확인이 필요합니다.")
 
-    # 지도 섹션에서 radius/dist_km 사용 — 기본값 먼저 초기화
-    radius  = verify_radius(ref_city)
-    dist_km = 0.0
-    if photo_file and gps_data:
-        dist_km = haversine(dest_coord[0], dest_coord[1], gps_data["lat"], gps_data["lon"])
-
-    if photo_file and gps_data:
-        st.markdown("#### 🗺️ 위치 시각화 지도")
-        clat = (dest_coord[0] + gps_data["lat"]) / 2
-        clon = (dest_coord[1] + gps_data["lon"]) / 2
-        m = folium.Map(location=[clat,clon], zoom_start=11, tiles="CartoDB positron")
-        folium.Circle(location=dest_coord, radius=int(radius*1000),
-                      color="#1a73e8", fill=True, fill_opacity=0.10,
-                      popup=f"목적지: {dest_name} (허용 반경 {radius:.0f}km)").add_to(m)
-        folium.Marker(dest_coord, popup=f"🏢 {dest_name}",
+    if points:
+        st.markdown("#### 🗺️ 이동 경로 지도")
+        lats = [base_coord[0]] + [p_["lat"] for p_ in points] + ([trip_coord[0]] if trip_coord else [])
+        lons = [base_coord[1]] + [p_["lon"] for p_ in points] + ([trip_coord[1]] if trip_coord else [])
+        m = folium.Map(location=[sum(lats) / len(lats), sum(lons) / len(lons)], tiles="OpenStreetMap")
+        folium.Marker(base_coord, tooltip=f"출발: {base_name}",
                       icon=folium.Icon(color="blue", icon="building", prefix="fa")).add_to(m)
-        pc = "green" if dist_km <= radius else "orange"
-        folium.Marker([gps_data["lat"], gps_data["lon"]],
-                      popup=f"📍 촬영 위치",
-                      icon=folium.Icon(color=pc, icon="camera", prefix="fa")).add_to(m)
-        folium.PolyLine(locations=[dest_coord,[gps_data["lat"],gps_data["lon"]]],
-                        color="#ff6b6b", weight=2, dash_array="8", opacity=0.7).add_to(m)
-        st_folium(m, width=None, height=420, returned_objects=[])
+        if trip_coord:
+            rr = verify_radius(trip_dest)
+            folium.Circle(trip_coord, radius=int(rr * 1000), color="#1a73e8", fill=True, fill_opacity=0.08,
+                          tooltip=f"출장지 {trip_dest} (허용 반경 {rr:.0f}km)").add_to(m)
+        for p_ in points:
+            color = "green" if p_["ok"] else ("orange" if p_["ok"] is False else "gray")
+            folium.Marker([p_["lat"], p_["lon"]], tooltip=f"{p_['name']} · {p_['city']} 인근",
+                          icon=folium.Icon(color=color, icon="camera", prefix="fa")).add_to(m)
+            folium.PolyLine([base_coord, [p_["lat"], p_["lon"]]], color="#1a73e8", weight=2,
+                            dash_array="8", opacity=0.7, tooltip=f"기관에서 {p_['d']:.0f}km").add_to(m)
+        m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], padding=(30, 30))
+        st_folium(m, width=None, height=440, returned_objects=[])
 
+    st.caption(f"판정 기준: 기관 소재지 {office_r:.0f}km 안에서 찍은 사진은 출장 증빙으로 보지 않음 · "
+               "출장지 허용 반경과 출발 기준 좌표는 '기관 설정'에서 바꿀 수 있음")
     st.markdown('</div>', unsafe_allow_html=True)
 
 
