@@ -578,7 +578,7 @@ def get_opinet_fuel_price(fuel_type: str):
 def extract_pdf_receipts(file_bytes: bytes) -> list[str]:
     """
     pdfplumber로 PDF를 컬럼별로 분리해 각 영수증 텍스트 리스트를 반환합니다.
-    하이패스 영수증은 3단 컬럼 레이아웃이므로 x 좌표로 컬럼을 나눕니다.
+    (개선: 블록 분리 기준을 '한국도로공사'로 단순화하여 누락 방지)
     """
     try:
         import pdfplumber
@@ -607,13 +607,13 @@ def extract_pdf_receipts(file_bytes: bytes) -> list[str]:
                         " ".join(w['text'] for w in sorted(lines[y], key=lambda x: x['x0']))
                         for y in sorted(lines)
                     )
-                    # 영수증이 포함된 컬럼만 추가 (KEC 또는 영업소 포함 여부로 판단)
-                    if re.search(r"영업소|KEC|통행료|\d종\s*\d", col_text):
-                        # 컬럼 안에 여러 영수증이 있을 수 있으므로 블록 분리 (수정 반영)
-                        blocks = re.split(r"(?=\d{4}년\d{2}월\d{2}일\s*\d{2}시\d{2}분|한국도로공사\s+\S+영업소|하이패스는)", col_text)
-                        for block in blocks:
-                            if re.search(r"KEC|종\s*[\d,]+\s*원|영업소", block):
-                                receipt_texts.append(block.strip())
+                    
+                    # '한국도로공사'가 나타날 때마다 영수증 블록을 확실하게 분리
+                    blocks = re.split(r"(?=한국도로공사\s)", col_text)
+                    for block in blocks:
+                        # 영업소 이름과 금액(숫자+원)이 모두 존재하는 블록만 유효한 영수증으로 취급
+                        if "영업소" in block and re.search(r"\d+(?:,\d+)*\s*원", block):
+                            receipt_texts.append(block.strip())
         return receipt_texts
     except Exception:
         return []
@@ -622,13 +622,13 @@ def extract_pdf_receipts(file_bytes: bytes) -> list[str]:
 def parse_single_receipt(block: str) -> dict | None:
     """단일 영수증 블록에서 정보를 파싱합니다."""
     # 영업소명
-    name_m = re.search(r"한국도로공사\s+(\S+영업소)", block)
+    name_m = re.search(r"한국도로공사\s+([가-힣a-zA-Z0-9]+영업소)", block)
     if not name_m:
-        name_m = re.search(r"(\S+영업소)", block)
+        name_m = re.search(r"([가-힣a-zA-Z0-9]+영업소)", block)
     office = name_m.group(1).strip() if name_m else ""
 
     # 날짜·시각
-    dt_m = re.search(r"(\d{4})년(\d{2})월(\d{2})일\s*(\d{2})시(\d{2})분", block)
+    dt_m = re.search(r"(\d{4})년\s*(\d{2})월\s*(\d{2})일\s*(\d{2})시\s*(\d{2})분", block)
     if dt_m:
         y, mo, d, h, mi = dt_m.groups()
         date_str = f"{y}.{mo}.{d}"
@@ -640,16 +640,23 @@ def parse_single_receipt(block: str) -> dict | None:
         dt_obj   = None
 
     # 입구영업소
-    entry_m = re.search(r"입구영업소\s*:\s*(\S+)", block)
+    entry_m = re.search(r"입구영업소\s*:\s*([가-힣a-zA-Z0-9]+)", block)
     entry   = entry_m.group(1).strip() if entry_m else None
 
-    # 금액 (KEC 우선)
-    amt_m = re.search(r"KEC\s*([\d,]+)\s*원", block)
-    if not amt_m:
-        amt_m = re.search(r"\d\s*종\s*([\d,]+)\s*원", block)
-    if not amt_m:
-        amt_m = re.search(r"공급가액\s*:\s*([\d,]+)\s*원", block)
-    amount = int(amt_m.group(1).replace(",", "")) if amt_m else 0
+    # 금액 (KEC -> N종 -> 통행료 -> 합계 순으로 샅샅이 검색)
+    amount = 0
+    amt_patterns = [
+        r"KEC\s*([\d,]+)\s*원",
+        r"\d\s*종\s*([\d,]+)\s*원",
+        r"통행료\s*([\d,]+)\s*원",
+        r"합\s*계\s*([\d,]+)\s*원",
+        r"공급가액\s*:\s*([\d,]+)\s*원"
+    ]
+    for pat in amt_patterns:
+        amt_m = re.search(pat, block)
+        if amt_m:
+            amount = int(amt_m.group(1).replace(",", ""))
+            break
 
     if not office and amount == 0:
         return None
@@ -667,13 +674,11 @@ def parse_single_receipt(block: str) -> dict | None:
 def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
     """
     하이패스 PDF 영수증 전체 파싱.
-    - file_bytes가 있으면 컬럼 분리 방식으로 정확하게 파싱
-    - text만 있으면 총액 텍스트 기반 파싱으로 폴백
     """
     cities = list(DISTANCE_FROM_SEOUL.keys())
     receipts = []
 
-    # ── 컬럼 분리 방식 (정확) ────────────────────
+    # ── 1. PDF 원본에서 영수증 직접 추출 ────────────────────
     if file_bytes:
         blocks = extract_pdf_receipts(file_bytes)
         for block in blocks:
@@ -681,13 +686,16 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
             if r:
                 receipts.append(r)
 
-    # ── 폴백: 텍스트 전체 파싱 ──────────────────
+    # ── 2. 추출 실패 시 텍스트 기반 백업 파싱 ──────────────────
     if not receipts and text:
-        offices  = re.findall(r"한국도로공사\s+(\S+영업소)", text)
-        times_raw = re.findall(r"(\d{4})년(\d{2})월(\d{2})일\s*(\d{2})시(\d{2})분", text)
-        entries  = re.findall(r"입구영업소\s*:\s*(\S+)", text)
-        kec_amts = re.findall(r"KEC\s*([\d,]+)\s*원", text)
-        amounts  = [int(a.replace(",", "")) for a in kec_amts]
+        offices  = re.findall(r"한국도로공사\s+([가-힣a-zA-Z0-9]+영업소)", text)
+        times_raw = re.findall(r"(\d{4})년\s*(\d{2})월\s*(\d{2})일\s*(\d{2})시\s*(\d{2})분", text)
+        entries  = re.findall(r"입구영업소\s*:\s*([가-힣a-zA-Z0-9]+)", text)
+        
+        # 금액 백업 파싱 (다양한 양식 대응)
+        amts_raw = re.findall(r"(?:KEC|\d\s*종|통행료|합\s*계)\s*([\d,]+)\s*원", text)
+        amounts  = [int(a.replace(",", "")) for a in amts_raw]
+        
         for i, office in enumerate(offices):
             t = times_raw[i] if i < len(times_raw) else None
             receipts.append({
@@ -713,60 +721,48 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
 
     # ── 통행료 합계 (영수증 수만큼 모두 자동 합산) ──────
     total_toll = sum(r["금액"] for r in receipts)
-    # 총액 텍스트로 검증 (개별 인식이 안 됐을 때를 대비한 폴백)
     total_m = re.search(r"총\s*\d+\s*건\s*/\s*([\d,]+)\s*원", text)
     if total_toll == 0 and total_m:
         total_toll = int(total_m.group(1).replace(",", ""))
 
-    # ── 출장일: 가장 이른 날짜 ─────────────────
+    # ── 출장일 및 요금소 판단 ─────────────────
     first = receipts[0] if receipts else {}
     trip_date = first.get("날짜") or datetime.date.today().strftime("%Y.%m.%d")
-
-    # ── 출발 요금소 ─────────────────────────────
     origin_gate = first.get("입구영업소") or first.get("영업소") or "출발요금소"
 
-    # ── 목적지 판단 (개선: 실제 간 곳 찾기) ─────────────
     dest_gate = "도착요금소"
     if len(receipts) == 1:
-        # 1장뿐이면 나간 곳이 목적지
         dest_gate = receipts[0].get("영업소") or "도착요금소"
     else:
-        # 여러 장(왕복 등)이면 출발 요금소와 이름이 다른 첫 번째 요금소를 실제 목적지로 판단
+        # 여러 장(왕복)이면 출발 요금소와 이름이 다른 첫 번째 요금소를 실제 목적지로 판단
         for r in receipts:
             gate = r.get("영업소")
             if gate and gate != origin_gate:
                 dest_gate = gate
                 break
-        # 만약 전부 이름이 똑같다면 첫 번째 영수증의 영업소를 사용
         if dest_gate == "도착요금소":
             dest_gate = receipts[0].get("영업소") or "도착요금소"
 
     # ── 도시 매핑 ────────────────────────────────
     def find_city(gate):
         city = gate_to_city(gate)
-        if city:
-            return city
+        if city: return city
         gate_clean = gate.replace("영업소","").replace("한국도로공사","").strip()
         city = gate_to_city(gate_clean)
-        if city:
-            return city
+        if city: return city
         for c in cities:
-            if c in gate:
-                return c
+            if c in gate: return c
         return None
 
     origin_city = find_city(origin_gate)
     dest_city   = find_city(dest_gate)
-
     last = receipts[-1] if receipts else {}
 
     # ── 왕복/편도 판단 ─────────────────────────────
-    # 영수증이 1장이면 편도(False) 처리하여 나중에 x2 하도록 함
     if len(receipts) <= 1:
         total_count_m = re.search(r"총\s*([2-9]|\d{2,})\s*건", text)
         is_total = bool(total_count_m)
     else:
-        # 영수증이 2장 이상 모였으면 이미 합산이 끝났으므로 왕복(True) 처리
         is_total = True
 
     return {
@@ -781,7 +777,6 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
         "method":      f"pdfplumber 컬럼 분리 파싱 (무료) — {len(receipts)}건",
         "is_total":    is_total,
     }
-
 
 
 # ══════════════════════════════════════════════
