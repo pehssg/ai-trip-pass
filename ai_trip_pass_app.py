@@ -96,6 +96,7 @@ _init("llm_preset", "사용 안 함 (규정 검색만)" if not _secret("LLM_BASE
 _init("llm_base_url", _secret("LLM_BASE_URL"))
 _init("llm_model", _secret("LLM_MODEL"))
 _init("llm_api_key", _secret("LLM_API_KEY"))
+_init("opinet_key", _secret("OPINET_API_KEY"))
 _init("ref_fuel_gasoline", 1652)
 _init("ref_fuel_diesel", 1498)
 _init("ref_fuel_lpg", 963)
@@ -520,6 +521,99 @@ def get_reference_fuel_price(fuel_type: str):
         return int(price), f"오피넷 전국 평균 ({data.get('updated', '')})"
     ref_date = st.session_state.get("ref_fuel_date", datetime.date.today())
     return int(st.session_state[FUEL_KEYS[fuel_type]]), f"기관 기준 유가 (관리자 설정, {ref_date})"
+
+
+# ── 출장일 유가: 오피넷 API(최근 7일 일별) → 자동 수집 기록 → 기관 기준 유가 ──
+OPINET_CODES = {"휘발유": "B027", "경유": "D047", "LPG": "K015"}
+
+
+def _opinet_items(payload):
+    """오피넷 JSON/XML 응답에서 (날짜, 유종코드, 가격) 목록을 뽑습니다."""
+    out = []
+    try:
+        data = json.loads(payload)
+        items = data.get("RESULT", {}).get("OIL", [])
+        items = items if isinstance(items, list) else [items]
+        for it in items:
+            out.append((str(it.get("DATE") or it.get("TRADE_DT") or ""), str(it.get("PRODCD", "")),
+                        float(str(it.get("PRICE", "0")).replace(",", ""))))
+        return out
+    except (ValueError, AttributeError):
+        pass
+    try:
+        import xml.etree.ElementTree as ET
+        for oil in ET.fromstring(payload).iter("OIL"):
+            g_ = lambda t: (oil.findtext(t) or "").strip()
+            out.append((g_("DATE") or g_("TRADE_DT"), g_("PRODCD"), float(g_("PRICE").replace(",", "") or 0)))
+    except Exception:
+        pass
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def opinet_recent_daily(prodcd: str, key: str) -> dict:
+    """오피넷 '최근 7일간 전국 일일 평균가격' → {YYYY-MM-DD: 가격}. 인증키 파라미터는 code(실패 시 apikey)."""
+    if not key:
+        return {}
+    for param in ("code", "apikey"):
+        try:
+            r = requests.get("https://www.opinet.co.kr/api/avgRecentPrice.do",
+                             params={"out": "json", "prodcd": prodcd, param: key}, timeout=8)
+            if r.status_code != 200:
+                continue
+            got = {}
+            for d, code, price in _opinet_items(r.text):
+                if (not code or code == prodcd) and len(d) == 8 and 400 < price < 4000:
+                    got[f"{d[:4]}-{d[4:6]}-{d[6:]}"] = round(price)
+            if got:
+                return got
+        except Exception:
+            continue
+    return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fuel_history_json() -> dict:
+    """GitHub Actions가 매일 쌓는 일별 유가 기록 fuel_price_history.json."""
+    try:
+        r = requests.get("https://raw.githubusercontent.com/pehssg/ai-trip-pass/main/fuel_price_history.json", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(APP_DIR, "fuel_price_history.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _norm_date(s_: str):
+    m = re.search(r"(\d{4})\D?(\d{1,2})\D?(\d{1,2})", s_ or "")
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def get_fuel_price_for_date(fuel_type: str, date_str: str):
+    """출장일 전국 평균 유가. 그날 값이 없으면(주말·공휴일 등) 3일 이내 가장 가까운 이전 날짜 값을 씁니다."""
+    d = _norm_date(date_str)
+    if d:
+        sources = [
+            (opinet_recent_daily(OPINET_CODES[fuel_type], st.session_state.get("opinet_key", "")), "오피넷 API"),
+            (fuel_history_json().get(fuel_type, {}), "오피넷 자동 수집 기록"),
+        ]
+        for back in range(0, 4):
+            day = (d - datetime.timedelta(days=back)).isoformat()
+            for table, label in sources:
+                if day in table:
+                    note = "" if back == 0 else f", 가장 가까운 {day} 값"
+                    return int(table[day]), f"오피넷 전국 평균 · 출장일 {d.isoformat()}{note} ({label})"
+    price, label = get_reference_fuel_price(fuel_type)
+    return price, label + (" · 출장일 유가 없음" if d else "")
 
 
 def get_opinet_fuel_price(fuel_type: str):
@@ -1265,7 +1359,8 @@ with tab1:
         st.session_state.fuel_type  = fuel_type
         st.session_state.car_model  = car_model
 
-        ref_price, ref_label = get_reference_fuel_price(fuel_type)
+        _fuel_day = st.session_state.get("receipt_trip_date") or st.session_state.get("trip_date") or ""
+        ref_price, ref_label = get_fuel_price_for_date(fuel_type, _fuel_day)
         manual = st.number_input("적용 유가 (원/L)", min_value=500, max_value=3000,
                                  value=int(ref_price), step=10, key=f"fuel_{fuel_type}_{ref_price}",
                                  help="기준 유가가 자동으로 들어갑니다. 출장일 유가가 다르면 수정하세요.")
@@ -1625,6 +1720,17 @@ with tab4:
         f2.number_input("경유 (원/L)", 500, 3000, step=10, key="ref_fuel_diesel")
         f3.number_input("LPG (원/L)", 300, 3000, step=10, key="ref_fuel_lpg")
         st.date_input("기준 유가 기준일", key="ref_fuel_date")
+        st.text_input("오피넷 API 인증키 (출장일 유가 자동 조회)", key="opinet_key", type="password",
+                      help="오피넷에서 발급받은 무료 인증키. 배포 환경에서는 Streamlit Secrets의 OPINET_API_KEY로 넣어 두면 됩니다.")
+        if st.button("오피넷 연결 테스트", disabled=not st.session_state.opinet_key):
+            opinet_recent_daily.clear()
+            _t = opinet_recent_daily("B027", st.session_state.opinet_key)
+            if _t:
+                _d = max(_t)
+                st.success(f"연결 성공 — 최근 {len(_t)}일 휘발유 전국 평균 수신 (최신 {_d}: {_t[_d]:,}원/L)")
+            else:
+                st.error("유가를 받지 못했습니다. 인증키 승인 여부를 확인하세요. 이 경우 자동 수집 기록이나 아래 기준 유가를 씁니다.")
+        st.caption("출장일 유가 적용 순서: 오피넷 API(최근 7일) → 매일 자동 수집 기록 → 위 기관 기준 유가")
         _oj = load_opinet_json() or {}
         if "오피넷" in str(_oj.get("source", "")) and "예비" not in str(_oj.get("source", "")):
             st.caption(f"오피넷 자동 갱신값({_oj.get('updated')})이 있으면 그 값이 우선 적용됩니다.")

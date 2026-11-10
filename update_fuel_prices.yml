@@ -1,0 +1,33 @@
+name: 오피넷 유가 자동 업데이트
+
+on:
+  schedule:
+    - cron: "0 0 * * *"    # 매일 오전 9시(한국시간)
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  update-fuel-prices:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 의존성 설치
+        run: pip install requests
+      - name: 오피넷 유가 수집
+        env:
+          OPINET_API_KEY: ${{ secrets.OPINET_API_KEY }}
+        run: python scripts/scrape_fuel_prices.py
+      - name: 변경사항 커밋 & 푸시
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🛢️ 유가 자동 업데이트"
+          file_pattern: fuel_prices.json fuel_price_history.json
