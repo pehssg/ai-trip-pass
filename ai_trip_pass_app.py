@@ -1383,7 +1383,8 @@ with tab2:
         try:
             img = Image.open(io.BytesIO(ph.getvalue()))
         except Exception:
-            rows.append({"사진": ph.name, "판정": "⚠️ 이미지를 열 수 없음"}); continue
+            rows.append({"사진": ph.name, "판정": "⚠️ 이미지를 열 수 없음"})
+            continue
         g_ = extract_exif_gps(img)
         if not g_:
             rows.append({"사진": ph.name, "촬영 시각": "-", "촬영 지역": "-", "기관에서 거리": "-",
@@ -1395,6 +1396,7 @@ with tab2:
         d_trip = haversine(trip_coord[0], trip_coord[1], lat, lon) if trip_coord else None
         shot = (g_.get("datetime") or "")[:10].replace(":", "-")
         notes = []
+        
         if d_office <= office_r:
             verdict, ok = "⚠️ 기관 소재지에서 촬영 · 출장 증빙 아님", False
         elif d_trip is not None and d_trip <= verify_radius(trip_dest):
@@ -1403,17 +1405,19 @@ with tab2:
             verdict, ok = f"⚠️ 출장지와 다른 곳({city} 인근) · 수기 확인", False
         else:
             verdict, ok = f"📍 {city} 인근 방문 추정 · 출장지 지정 필요", None
+            
         if shot and trip_date and shot != trip_date:
             notes.append(f"촬영일 {shot} ≠ 출장일 {trip_date}")
             if ok:
                 verdict, ok = verdict + " (촬영일 확인 필요)", False
+                
         rows.append({"사진": ph.name, "촬영 시각": (g_.get("datetime") or "-").replace(":", "-", 2),
                      "촬영 지역": city, "기관에서 거리": f"{d_office:.1f} km",
                      "출장지에서 거리": f"{d_trip:.1f} km" if d_trip is not None else "-",
                      "판정": verdict + (f" · {'; '.join(notes)}" if notes else "")})
         points.append({"name": ph.name, "lat": lat, "lon": lon, "ok": ok, "city": city, "d": d_office})
 
-if rows:
+    if rows:
         st.markdown("#### 📏 사진별 확인 결과")
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
         
