@@ -711,38 +711,35 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
             "is_total": True, "failed": True,
         }
 
-    # ── 통행료 합계 ──────────────────────────────
+    # ── 통행료 합계 (영수증 수만큼 모두 자동 합산) ──────
     total_toll = sum(r["금액"] for r in receipts)
-    # 총액 텍스트로 검증
+    # 총액 텍스트로 검증 (개별 인식이 안 됐을 때를 대비한 폴백)
     total_m = re.search(r"총\s*\d+\s*건\s*/\s*([\d,]+)\s*원", text)
-    if total_m:
+    if total_toll == 0 and total_m:
         total_toll = int(total_m.group(1).replace(",", ""))
 
     # ── 출장일: 가장 이른 날짜 ─────────────────
     first = receipts[0] if receipts else {}
     trip_date = first.get("날짜") or datetime.date.today().strftime("%Y.%m.%d")
 
-    # ── 출발 요금소: 가장 이른 시각의 입구영업소 ─
+    # ── 출발 요금소 ─────────────────────────────
     origin_gate = first.get("입구영업소") or first.get("영업소") or "출발요금소"
 
-    # ── 목적지 판단 로직 ──────────────────────────
-    middle_receipts = [r for r in receipts if not r.get("입구영업소")]
-
-    if middle_receipts:
-        has_dt = [r for r in middle_receipts if r.get("datetime")]
-        if has_dt and first.get("datetime") and receipts[-1].get("datetime"):
-            start_dt = first["datetime"]
-            end_dt   = receipts[-1]["datetime"]
-            mid_dt   = start_dt + (end_dt - start_dt) / 2
-            closest  = min(has_dt,
-                           key=lambda r: abs((r["datetime"] - mid_dt).total_seconds()))
-            dest_gate = closest.get("영업소") or "도착요금소"
-        else:
-            from collections import Counter
-            names = [r["영업소"].replace("영업소","").strip() for r in middle_receipts]
-            dest_gate = Counter(names).most_common(1)[0][0] + "영업소"
-    else:
+    # ── 목적지 판단 (개선: 실제 간 곳 찾기) ─────────────
+    dest_gate = "도착요금소"
+    if len(receipts) == 1:
+        # 1장뿐이면 나간 곳이 목적지
         dest_gate = receipts[0].get("영업소") or "도착요금소"
+    else:
+        # 여러 장(왕복 등)이면 출발 요금소와 이름이 다른 첫 번째 요금소를 실제 목적지로 판단
+        for r in receipts:
+            gate = r.get("영업소")
+            if gate and gate != origin_gate:
+                dest_gate = gate
+                break
+        # 만약 전부 이름이 똑같다면 첫 번째 영수증의 영업소를 사용
+        if dest_gate == "도착요금소":
+            dest_gate = receipts[0].get("영업소") or "도착요금소"
 
     # ── 도시 매핑 ────────────────────────────────
     def find_city(gate):
@@ -763,13 +760,14 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
 
     last = receipts[-1] if receipts else {}
 
-    # 영수증이 정확히 1장 뿐이면 편도(False)로 처리하여 나중에 2배가 되도록 함
-    if len(receipts) == 1:
-        is_total = False
-    else:
-        # 영수증이 2장 이상이거나, 텍스트에 '총 2건 이상' 문구가 있으면 왕복(True)
+    # ── 왕복/편도 판단 ─────────────────────────────
+    # 영수증이 1장이면 편도(False) 처리하여 나중에 x2 하도록 함
+    if len(receipts) <= 1:
         total_count_m = re.search(r"총\s*([2-9]|\d{2,})\s*건", text)
-        is_total = len(receipts) >= 2 or bool(total_count_m)
+        is_total = bool(total_count_m)
+    else:
+        # 영수증이 2장 이상 모였으면 이미 합산이 끝났으므로 왕복(True) 처리
+        is_total = True
 
     return {
         "trip_date":   trip_date,
@@ -779,7 +777,7 @@ def parse_receipts(text: str = "", file_bytes: bytes = None) -> dict:
         "dest_gate":   dest_gate,
         "origin_city": origin_city,
         "dest_city":   dest_city,
-        "ocr_text":    f"영수증 {len(receipts)}건 인식 | 출발: {origin_gate}({first.get('시각','')}) → 도착: {dest_gate}({last.get('시각','')})",
+        "ocr_text":    f"영수증 {len(receipts)}건 인식 | 출발: {origin_gate}({first.get('시각','')}) → 실제 목적지: {dest_gate}",
         "method":      f"pdfplumber 컬럼 분리 파싱 (무료) — {len(receipts)}건",
         "is_total":    is_total,
     }
